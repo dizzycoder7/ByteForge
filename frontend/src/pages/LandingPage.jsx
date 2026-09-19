@@ -41,7 +41,7 @@ export default function LandingPage() {
 
           {/* Master Programming Subtitle */}
           <h2 className="text-2xl sm:text-3xl md:text-[32px] font-extrabold text-[#1f2937] tracking-tight mb-2">
-            Master Programming with ByteChef
+            Master Programming with ByteForge
           </h2>
 
           {/* Main Huge Blue Headline */}
@@ -852,7 +852,7 @@ export default function LandingPage() {
             </div>
 
             <span className="text-xs font-semibold text-gray-500 block">
-              Partner with CodeChef
+              Partner with ByteForge
             </span>
 
             <h2 className="text-2xl sm:text-3xl md:text-[32px] font-black text-gray-900 leading-snug">
@@ -860,7 +860,7 @@ export default function LandingPage() {
             </h2>
 
             <p className="text-sm text-gray-600 leading-relaxed">
-              Join forces with CodeChef to bring structured coding programs, AI-enhanced learning, and global contests to your students. Empower them with the skills and certifications they need to move confidently from code to career.
+              Join forces with ByteForge to bring structured coding programs, AI-enhanced learning, and global contests to your students. Empower them with the skills and certifications they need to move confidently from code to career.
             </p>
 
             <div className="pt-3">
@@ -896,11 +896,11 @@ export default function LandingPage() {
       </section>
 
       {/* ──────────────────────────────────────────────────────────────────────── */}
-      {/* 9. FOOTER (CodeChef Signature Clean Footer)                              */}
+      {/* 9. FOOTER                                                                 */}
       {/* ──────────────────────────────────────────────────────────────────────── */}
       <footer className="bg-white border-t border-gray-200 py-10 px-4 text-center text-xs text-gray-500">
         <div className="max-w-6xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-4">
-          <p>© 2026 CodeChef | ByteChef — A Competitive Programming Platform.</p>
+          <p>© 2026 ByteForge — A Competitive Programming Platform.</p>
           <div className="flex gap-6 font-semibold text-gray-600">
             <Link to="/problems" className="hover:text-blue-600">Practice</Link>
             <Link to="/leaderboard" className="hover:text-blue-600">Compete</Link>
