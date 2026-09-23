@@ -5,9 +5,11 @@ COPY backend/pom.xml ./pom.xml
 COPY backend/src ./src
 RUN mvn clean package -DskipTests
 
-# Stage 2: Minimal Java 21 Runtime
-FROM eclipse-temurin:21-jre-alpine
+# Stage 2: Full Java 21 JDK + Compilers for the Judge Engine
+FROM eclipse-temurin:21-jdk-alpine
+RUN apk add --no-cache g++ python3
 WORKDIR /app
 COPY --from=build /app/target/byteforge-0.0.1-SNAPSHOT.jar app.jar
 EXPOSE 8080
 ENTRYPOINT ["java", "-jar", "app.jar"]
+
