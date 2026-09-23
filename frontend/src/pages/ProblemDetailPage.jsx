@@ -5,6 +5,7 @@ import { useAuth } from '../context/AuthContext'
 import VerdictBadge from '../components/VerdictBadge'
 import Spinner from '../components/Spinner'
 import api from '../api/axios'
+import { getStarterCode } from '../data/problemTemplates'
 
 const LANGUAGES = [
   { value: 'JAVA',   label: 'Java 21',   monaco: 'java' },
@@ -75,6 +76,7 @@ export default function ProblemDetailPage() {
         }
 
         setProblem(prob)
+        setCode(getStarterCode(prob.slug, language))
 
         try {
           const { data: samps } = await api.get(`/problems/${prob.id}/testcases/samples`)
@@ -116,7 +118,7 @@ export default function ProblemDetailPage() {
   // ── Handlers ──────────────────────────────────────────────────────────────
   const handleLanguageChange = (lang) => {
     setLanguage(lang)
-    setCode(STARTERS[lang])
+    setCode(getStarterCode(problem?.slug, lang))
   }
 
   const handleSubmit = async () => {
