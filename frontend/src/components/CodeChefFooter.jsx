@@ -49,10 +49,8 @@ export default function CodeChefFooter() {
             </div>
 
             <p className="leading-relaxed text-[12px] text-gray-300 max-w-xs">
-              Bizzhub Workspaces, 6th Floor,<br />
-              MSR North Tower, Outer Ring Rd,<br />
-              Manayata Tech Park, Nagavara,<br />
-              Bengaluru, Karnataka 560045
+              Dehradun, Uttarakhand
+
             </p>
 
             <div className="space-y-1 text-[12px] pt-1">
@@ -61,7 +59,7 @@ export default function CodeChefFooter() {
                   help@byteforge.tech
                 </a>
               </p>
-              <p className="text-gray-300">+91 95911 47880</p>
+              <p className="text-gray-300">9939769096</p>
             </div>
 
             {/* Social Icons Row */}
