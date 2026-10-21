@@ -37,10 +37,13 @@ public class CollegeAssessmentController {
             @PathVariable Long id,
             Authentication authentication) {
 
-        List<com.byteforge.entity.AssessmentProblem> problems = problemRepository.findByAssessmentIdOrderByOrderIndexAsc(id);
+        List<com.byteforge.entity.AssessmentProblem> problems = problemRepository
+                .findByAssessmentIdOrderByOrderIndexAsc(id);
 
-        // Security check: Only FACULTY_ADMIN and ADMIN are permitted to inspect hidden test cases.
-        // For students taking the exam, hiddenTestCasesJson is masked to "[]" to prevent cheating.
+        // Security check: Only FACULTY_ADMIN and ADMIN are permitted to inspect hidden
+        // test cases.
+        // For students taking the exam, hiddenTestCasesJson is masked to "[]" to
+        // prevent cheating.
         boolean isFacultyOrAdmin = authentication != null && authentication.getAuthorities().stream()
                 .anyMatch(a -> a.getAuthority().equals("ROLE_ADMIN") || a.getAuthority().equals("ROLE_FACULTY_ADMIN"));
 
@@ -66,7 +69,8 @@ public class CollegeAssessmentController {
         com.byteforge.entity.AssessmentProblem problem = com.byteforge.entity.AssessmentProblem.builder()
                 .assessmentId(id)
                 .title(request.title())
-                .difficulty(request.difficulty() != null && !request.difficulty().isBlank() ? request.difficulty() : "MEDIUM")
+                .difficulty(request.difficulty() != null && !request.difficulty().isBlank() ? request.difficulty()
+                        : "MEDIUM")
                 .points(request.points() != null && request.points() > 0 ? request.points() : 50)
                 .description(request.description())
                 .constraints(request.constraints() != null ? request.constraints() : "1 <= N <= 10^5")
@@ -89,7 +93,8 @@ public class CollegeAssessmentController {
         return ResponseEntity.noContent().build();
     }
 
-    private com.byteforge.dto.AssessmentProblemDto mapProblemToDto(com.byteforge.entity.AssessmentProblem p, boolean includeHidden) {
+    private com.byteforge.dto.AssessmentProblemDto mapProblemToDto(com.byteforge.entity.AssessmentProblem p,
+            boolean includeHidden) {
         return new com.byteforge.dto.AssessmentProblemDto(
                 p.getId(),
                 p.getAssessmentId(),
@@ -105,8 +110,7 @@ public class CollegeAssessmentController {
                 includeHidden ? p.getHiddenTestCasesJson() : "[]",
                 p.getStarterCodesJson(),
                 p.getOrderIndex(),
-                p.getCreatedAt()
-        );
+                p.getCreatedAt());
     }
 
     @PostMapping
@@ -114,7 +118,8 @@ public class CollegeAssessmentController {
         CollegeAssessment assessment = CollegeAssessment.builder()
                 .cohort(request.cohort() != null ? request.cohort() : "CSE General")
                 .assessmentName(request.assessmentName())
-                .startTime(request.startTime() != null && !request.startTime().isBlank() ? request.startTime() : "2026-09-05 10:00:00")
+                .startTime(request.startTime() != null && !request.startTime().isBlank() ? request.startTime()
+                        : "2026-09-05 10:00:00")
                 .durationDays(request.durationDays() != null ? request.durationDays() : 0)
                 .durationHours(request.durationHours() != null ? request.durationHours() : 1)
                 .durationMins(request.durationMins() != null ? request.durationMins() : 30)
@@ -140,7 +145,8 @@ public class CollegeAssessmentController {
         if (college != null && !college.isBlank()) {
             list = assessmentRepository.findByCollegeNameContainingIgnoreCaseOrderByCreatedAtDesc(college.trim());
             if (list.isEmpty() && college.contains("DTU")) {
-                list = assessmentRepository.findByCollegeNameContainingIgnoreCaseOrderByCreatedAtDesc("Delhi Technological University");
+                list = assessmentRepository
+                        .findByCollegeNameContainingIgnoreCaseOrderByCreatedAtDesc("Delhi Technological University");
             }
         } else {
             list = assessmentRepository.findAllByOrderByCreatedAtDesc();
@@ -175,6 +181,7 @@ public class CollegeAssessmentController {
      * Submits and judges a student's assessment solution.
      * Evaluates code against problem test cases, computes partial marks,
      * and assigns deterministic verdict.
+     * Enforces assessment lifecycle (rejects if assessment concluded) and prevents duplicate attempts.
      */
     @PostMapping("/{id}/submissions")
     public ResponseEntity<com.byteforge.dto.AssessmentSubmissionResponse> submitAssessment(
@@ -194,14 +201,32 @@ public class CollegeAssessmentController {
         String language = request.language() != null ? request.language() : "JAVA";
         String sourceCode = request.sourceCode() != null ? request.sourceCode() : "// No code submitted";
 
+        boolean isFacultyOrAdmin = authentication != null && authentication.getAuthorities().stream()
+                .anyMatch(a -> a.getAuthority().equals("ROLE_ADMIN") || a.getAuthority().equals("ROLE_FACULTY_ADMIN"));
+
+        // Server-Side Status & Deadline Enforcement: Concluded assessments reject new submissions
+        CollegeAssessment assessment = assessmentRepository.findById(id).orElse(null);
+        if (assessment != null && !isFacultyOrAdmin) {
+            String status = assessment.getStatus() != null ? assessment.getStatus().trim().toUpperCase() : "ACTIVE";
+            if ("COMPLETED".equals(status) || "PAST".equals(status)) {
+                throw new org.springframework.web.server.ResponseStatusException(
+                        HttpStatus.FORBIDDEN, "Assessment has concluded. Submissions are closed.");
+            }
+        }
+
+        // Single Attempt Policy: Prevent duplicate submissions for the same problem by a student
+        if (!isFacultyOrAdmin && submissionRepository.existsByAssessmentIdAndStudentHandleAndProblemTitle(id, studentHandle, problemTitle)) {
+            throw new org.springframework.web.server.ResponseStatusException(
+                    HttpStatus.CONFLICT, "You have already submitted a solution for: " + problemTitle);
+        }
+
         // Verified backend judging against test cases
         SubmissionEvaluation evaluation = assessmentJudgeService.judgeAssessmentSubmission(
                 id,
                 problemTitle,
                 sourceCode,
                 language,
-                request.tabSwitchFlags()
-        );
+                request.tabSwitchFlags());
 
         com.byteforge.entity.AssessmentSubmission sub = com.byteforge.entity.AssessmentSubmission.builder()
                 .assessmentId(id)
@@ -214,7 +239,8 @@ public class CollegeAssessmentController {
                 .score(evaluation.score())
                 .verdict(evaluation.detailedVerdict())
                 .tabSwitchFlags(request.tabSwitchFlags())
-                .timeTaken(request.timeTaken() != null ? request.timeTaken() : (evaluation.maxExecutionTimeMs() + " ms"))
+                .timeTaken(
+                        request.timeTaken() != null ? request.timeTaken() : (evaluation.maxExecutionTimeMs() + " ms"))
                 .facultyFeedback(evaluation.errorMessage())
                 .build();
 
@@ -224,7 +250,8 @@ public class CollegeAssessmentController {
     }
 
     /**
-     * Batch submission endpoint: Evaluates and grades multiple problems from an assessment exam session.
+     * Batch submission endpoint: Evaluates and grades multiple problems from an
+     * assessment exam session.
      */
     @PostMapping("/{id}/submissions/batch")
     public ResponseEntity<List<com.byteforge.dto.AssessmentSubmissionResponse>> submitAssessmentBatch(
@@ -234,12 +261,36 @@ public class CollegeAssessmentController {
 
         List<com.byteforge.dto.AssessmentSubmissionResponse> responses = new ArrayList<>();
         for (com.byteforge.dto.StudentAssessmentSubmitRequest req : requests) {
-            ResponseEntity<com.byteforge.dto.AssessmentSubmissionResponse> res = submitAssessment(id, req, authentication);
+            ResponseEntity<com.byteforge.dto.AssessmentSubmissionResponse> res = submitAssessment(id, req,
+                    authentication);
             if (res.getBody() != null) {
                 responses.add(res.getBody());
             }
         }
         return ResponseEntity.status(HttpStatus.CREATED).body(responses);
+    }
+
+    /**
+     * Retrieves all recorded submissions for this assessment made by the current student.
+     * Used by the frontend workspace to detect past attempts, resume state, and display final scorecard.
+     */
+    @GetMapping("/{id}/my-submissions")
+    public ResponseEntity<List<com.byteforge.dto.AssessmentSubmissionResponse>> getMyAssessmentSubmissions(
+            @PathVariable Long id,
+            @RequestParam(required = false) String studentHandle,
+            Authentication authentication) {
+
+        String handle = (studentHandle != null && !studentHandle.isBlank())
+                ? studentHandle
+                : (authentication != null ? authentication.getName() : "student_user");
+
+        List<com.byteforge.dto.AssessmentSubmissionResponse> list = submissionRepository
+                .findByAssessmentIdAndStudentHandleOrderBySubmittedAtDesc(id, handle)
+                .stream()
+                .map(this::mapToSubmissionResponse)
+                .toList();
+
+        return ResponseEntity.ok(list);
     }
 
     @GetMapping("/{id}/submissions")
@@ -269,7 +320,8 @@ public class CollegeAssessmentController {
             } else if (scoreObj instanceof String) {
                 try {
                     sub.setScore(Integer.parseInt((String) scoreObj));
-                } catch (NumberFormatException ignored) {}
+                } catch (NumberFormatException ignored) {
+                }
             }
         }
         if (body.containsKey("facultyFeedback")) {
@@ -291,7 +343,8 @@ public class CollegeAssessmentController {
         return ResponseEntity.ok(report);
     }
 
-    private com.byteforge.dto.AssessmentSubmissionResponse mapToSubmissionResponse(com.byteforge.entity.AssessmentSubmission s) {
+    private com.byteforge.dto.AssessmentSubmissionResponse mapToSubmissionResponse(
+            com.byteforge.entity.AssessmentSubmission s) {
         return new com.byteforge.dto.AssessmentSubmissionResponse(
                 s.getId(),
                 s.getAssessmentId(),
@@ -306,8 +359,7 @@ public class CollegeAssessmentController {
                 s.getTabSwitchFlags(),
                 s.getTimeTaken(),
                 s.getFacultyFeedback(),
-                s.getSubmittedAt()
-        );
+                s.getSubmittedAt());
     }
 
     private AssessmentResponse mapToResponse(CollegeAssessment a) {
@@ -327,7 +379,6 @@ public class CollegeAssessmentController {
                 a.getAllowedLanguages(),
                 a.getCollegeName(),
                 a.getStatus(),
-                a.getCreatedAt()
-        );
+                a.getCreatedAt());
     }
 }

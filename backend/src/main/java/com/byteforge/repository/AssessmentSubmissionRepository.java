@@ -10,4 +10,7 @@ import java.util.List;
 public interface AssessmentSubmissionRepository extends JpaRepository<AssessmentSubmission, Long> {
     List<AssessmentSubmission> findByAssessmentIdOrderBySubmittedAtDesc(Long assessmentId);
     List<AssessmentSubmission> findByStudentHandleOrderBySubmittedAtDesc(String studentHandle);
+    List<AssessmentSubmission> findByAssessmentIdAndStudentHandleOrderBySubmittedAtDesc(Long assessmentId, String studentHandle);
+    boolean existsByAssessmentIdAndStudentHandleAndProblemTitle(Long assessmentId, String studentHandle, String problemTitle);
+    boolean existsByAssessmentIdAndStudentHandle(Long assessmentId, String studentHandle);
 }
