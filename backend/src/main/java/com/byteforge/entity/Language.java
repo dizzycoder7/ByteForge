@@ -12,5 +12,7 @@ package com.byteforge.entity;
 public enum Language {
     JAVA,
     CPP,
-    PYTHON
+    PYTHON,
+    C
 }
+

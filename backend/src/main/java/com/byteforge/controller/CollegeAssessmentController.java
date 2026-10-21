@@ -3,18 +3,23 @@ package com.byteforge.controller;
 import com.byteforge.dto.AssessmentResponse;
 import com.byteforge.dto.CreateAssessmentRequest;
 import com.byteforge.entity.CollegeAssessment;
+import com.byteforge.judge.SubmissionEvaluation;
 import com.byteforge.repository.CollegeAssessmentRepository;
+import com.byteforge.service.AssessmentJudgeService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /**
  * Controller for CodeChef College Offering Assessments.
- * Handles faculty creating and managing lab coding assessments and tests.
+ * Handles faculty creating and managing lab coding assessments and tests,
+ * secure student problem access, and verified backend judging.
  */
 @RestController
 @RequestMapping("/api/college/assessments")
@@ -25,14 +30,22 @@ public class CollegeAssessmentController {
     private final com.byteforge.repository.AssessmentSubmissionRepository submissionRepository;
     private final com.byteforge.service.PlagiarismService plagiarismService;
     private final com.byteforge.repository.AssessmentProblemRepository problemRepository;
+    private final AssessmentJudgeService assessmentJudgeService;
 
     @GetMapping("/{id}/problems")
-    public ResponseEntity<List<com.byteforge.dto.AssessmentProblemDto>> getAssessmentProblems(@PathVariable Long id) {
+    public ResponseEntity<List<com.byteforge.dto.AssessmentProblemDto>> getAssessmentProblems(
+            @PathVariable Long id,
+            Authentication authentication) {
+
         List<com.byteforge.entity.AssessmentProblem> problems = problemRepository.findByAssessmentIdOrderByOrderIndexAsc(id);
-        
-        // If no problems exist yet for this assessment, return an empty list or seeded defaults
+
+        // Security check: Only FACULTY_ADMIN and ADMIN are permitted to inspect hidden test cases.
+        // For students taking the exam, hiddenTestCasesJson is masked to "[]" to prevent cheating.
+        boolean isFacultyOrAdmin = authentication != null && authentication.getAuthorities().stream()
+                .anyMatch(a -> a.getAuthority().equals("ROLE_ADMIN") || a.getAuthority().equals("ROLE_FACULTY_ADMIN"));
+
         List<com.byteforge.dto.AssessmentProblemDto> dtos = problems.stream()
-                .map(this::mapProblemToDto)
+                .map(p -> mapProblemToDto(p, isFacultyOrAdmin))
                 .toList();
 
         return ResponseEntity.ok(dtos);
@@ -42,7 +55,7 @@ public class CollegeAssessmentController {
     public ResponseEntity<com.byteforge.dto.AssessmentProblemDto> addAssessmentProblem(
             @PathVariable Long id,
             @Valid @RequestBody com.byteforge.dto.CreateAssessmentProblemRequest request) {
-        
+
         // Ensure assessment exists
         if (!assessmentRepository.existsById(id)) {
             throw new RuntimeException("Assessment not found with id: " + id);
@@ -67,7 +80,7 @@ public class CollegeAssessmentController {
                 .build();
 
         com.byteforge.entity.AssessmentProblem saved = problemRepository.save(problem);
-        return ResponseEntity.status(HttpStatus.CREATED).body(mapProblemToDto(saved));
+        return ResponseEntity.status(HttpStatus.CREATED).body(mapProblemToDto(saved, true));
     }
 
     @DeleteMapping("/{id}/problems/{problemId}")
@@ -76,7 +89,7 @@ public class CollegeAssessmentController {
         return ResponseEntity.noContent().build();
     }
 
-    private com.byteforge.dto.AssessmentProblemDto mapProblemToDto(com.byteforge.entity.AssessmentProblem p) {
+    private com.byteforge.dto.AssessmentProblemDto mapProblemToDto(com.byteforge.entity.AssessmentProblem p, boolean includeHidden) {
         return new com.byteforge.dto.AssessmentProblemDto(
                 p.getId(),
                 p.getAssessmentId(),
@@ -89,7 +102,7 @@ public class CollegeAssessmentController {
                 p.getOutputFormat(),
                 p.getSampleInput(),
                 p.getSampleOutput(),
-                p.getHiddenTestCasesJson(),
+                includeHidden ? p.getHiddenTestCasesJson() : "[]",
                 p.getStarterCodesJson(),
                 p.getOrderIndex(),
                 p.getCreatedAt()
@@ -158,42 +171,75 @@ public class CollegeAssessmentController {
         return ResponseEntity.ok(mapToResponse(assessment));
     }
 
+    /**
+     * Submits and judges a student's assessment solution.
+     * Evaluates code against problem test cases, computes partial marks,
+     * and assigns deterministic verdict.
+     */
     @PostMapping("/{id}/submissions")
     public ResponseEntity<com.byteforge.dto.AssessmentSubmissionResponse> submitAssessment(
             @PathVariable Long id,
-            @RequestBody com.byteforge.dto.StudentAssessmentSubmitRequest request) {
+            @RequestBody com.byteforge.dto.StudentAssessmentSubmitRequest request,
+            Authentication authentication) {
+
+        String studentHandle = request.studentHandle() != null && !request.studentHandle().isBlank()
+                ? request.studentHandle()
+                : (authentication != null ? authentication.getName() : "student_user");
+
+        String studentName = request.studentName() != null && !request.studentName().isBlank()
+                ? request.studentName()
+                : studentHandle;
+
+        String problemTitle = request.problemTitle() != null ? request.problemTitle() : "Practical Question 1";
+        String language = request.language() != null ? request.language() : "JAVA";
+        String sourceCode = request.sourceCode() != null ? request.sourceCode() : "// No code submitted";
+
+        // Verified backend judging against test cases
+        SubmissionEvaluation evaluation = assessmentJudgeService.judgeAssessmentSubmission(
+                id,
+                problemTitle,
+                sourceCode,
+                language,
+                request.tabSwitchFlags()
+        );
+
         com.byteforge.entity.AssessmentSubmission sub = com.byteforge.entity.AssessmentSubmission.builder()
                 .assessmentId(id)
-                .studentName(request.studentName() != null ? request.studentName() : "Student")
-                .studentHandle(request.studentHandle() != null ? request.studentHandle() : "student_user")
+                .studentName(studentName)
+                .studentHandle(studentHandle)
                 .rollNo(request.rollNo() != null ? request.rollNo() : "2023CSB1001")
-                .problemTitle(request.problemTitle() != null ? request.problemTitle() : "Practical Question 1")
-                .language(request.language() != null ? request.language() : "JAVA")
-                .sourceCode(request.sourceCode() != null ? request.sourceCode() : "// No code submitted")
-                .score(request.score() > 0 ? request.score() : 90)
-                .verdict(request.verdict() != null ? request.verdict() : "ACCEPTED (10/10 Testcases)")
+                .problemTitle(problemTitle)
+                .language(language)
+                .sourceCode(sourceCode)
+                .score(evaluation.score())
+                .verdict(evaluation.detailedVerdict())
                 .tabSwitchFlags(request.tabSwitchFlags())
-                .timeTaken(request.timeTaken() != null ? request.timeTaken() : "35 mins")
+                .timeTaken(request.timeTaken() != null ? request.timeTaken() : (evaluation.maxExecutionTimeMs() + " ms"))
+                .facultyFeedback(evaluation.errorMessage())
                 .build();
 
         com.byteforge.entity.AssessmentSubmission saved = submissionRepository.save(sub);
 
-        return ResponseEntity.status(HttpStatus.CREATED).body(new com.byteforge.dto.AssessmentSubmissionResponse(
-                saved.getId(),
-                saved.getAssessmentId(),
-                saved.getStudentName(),
-                saved.getStudentHandle(),
-                saved.getRollNo(),
-                saved.getProblemTitle(),
-                saved.getLanguage(),
-                saved.getSourceCode(),
-                saved.getScore(),
-                saved.getVerdict(),
-                saved.getTabSwitchFlags(),
-                saved.getTimeTaken(),
-                saved.getFacultyFeedback(),
-                saved.getSubmittedAt()
-        ));
+        return ResponseEntity.status(HttpStatus.CREATED).body(mapToSubmissionResponse(saved));
+    }
+
+    /**
+     * Batch submission endpoint: Evaluates and grades multiple problems from an assessment exam session.
+     */
+    @PostMapping("/{id}/submissions/batch")
+    public ResponseEntity<List<com.byteforge.dto.AssessmentSubmissionResponse>> submitAssessmentBatch(
+            @PathVariable Long id,
+            @RequestBody List<com.byteforge.dto.StudentAssessmentSubmitRequest> requests,
+            Authentication authentication) {
+
+        List<com.byteforge.dto.AssessmentSubmissionResponse> responses = new ArrayList<>();
+        for (com.byteforge.dto.StudentAssessmentSubmitRequest req : requests) {
+            ResponseEntity<com.byteforge.dto.AssessmentSubmissionResponse> res = submitAssessment(id, req, authentication);
+            if (res.getBody() != null) {
+                responses.add(res.getBody());
+            }
+        }
+        return ResponseEntity.status(HttpStatus.CREATED).body(responses);
     }
 
     @GetMapping("/{id}/submissions")
@@ -202,22 +248,7 @@ public class CollegeAssessmentController {
         List<com.byteforge.dto.AssessmentSubmissionResponse> list = submissionRepository
                 .findByAssessmentIdOrderBySubmittedAtDesc(id)
                 .stream()
-                .map(s -> new com.byteforge.dto.AssessmentSubmissionResponse(
-                        s.getId(),
-                        s.getAssessmentId(),
-                        s.getStudentName(),
-                        s.getStudentHandle(),
-                        s.getRollNo(),
-                        s.getProblemTitle(),
-                        s.getLanguage(),
-                        s.getSourceCode(),
-                        s.getScore(),
-                        s.getVerdict(),
-                        s.getTabSwitchFlags(),
-                        s.getTimeTaken(),
-                        s.getFacultyFeedback(),
-                        s.getSubmittedAt()
-                ))
+                .map(this::mapToSubmissionResponse)
                 .toList();
 
         return ResponseEntity.ok(list);
@@ -250,22 +281,7 @@ public class CollegeAssessmentController {
 
         com.byteforge.entity.AssessmentSubmission updated = submissionRepository.save(sub);
 
-        return ResponseEntity.ok(new com.byteforge.dto.AssessmentSubmissionResponse(
-                updated.getId(),
-                updated.getAssessmentId(),
-                updated.getStudentName(),
-                updated.getStudentHandle(),
-                updated.getRollNo(),
-                updated.getProblemTitle(),
-                updated.getLanguage(),
-                updated.getSourceCode(),
-                updated.getScore(),
-                updated.getVerdict(),
-                updated.getTabSwitchFlags(),
-                updated.getTimeTaken(),
-                updated.getFacultyFeedback(),
-                updated.getSubmittedAt()
-        ));
+        return ResponseEntity.ok(mapToSubmissionResponse(updated));
     }
 
     @GetMapping("/{id}/plagiarism")
@@ -273,6 +289,25 @@ public class CollegeAssessmentController {
             @PathVariable Long id) {
         com.byteforge.dto.PlagiarismReportDto report = plagiarismService.analyzeAssessmentPlagiarism(id);
         return ResponseEntity.ok(report);
+    }
+
+    private com.byteforge.dto.AssessmentSubmissionResponse mapToSubmissionResponse(com.byteforge.entity.AssessmentSubmission s) {
+        return new com.byteforge.dto.AssessmentSubmissionResponse(
+                s.getId(),
+                s.getAssessmentId(),
+                s.getStudentName(),
+                s.getStudentHandle(),
+                s.getRollNo(),
+                s.getProblemTitle(),
+                s.getLanguage(),
+                s.getSourceCode(),
+                s.getScore(),
+                s.getVerdict(),
+                s.getTabSwitchFlags(),
+                s.getTimeTaken(),
+                s.getFacultyFeedback(),
+                s.getSubmittedAt()
+        );
     }
 
     private AssessmentResponse mapToResponse(CollegeAssessment a) {

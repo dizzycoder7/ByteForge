@@ -62,6 +62,18 @@ public class SubmissionService {
             // Return 404 (not 403) to avoid leaking the existence of draft problems
         }
 
+        // Idempotency / Deduplication: Avoid duplicate processing if identical submission was made within 4 seconds
+        java.time.LocalDateTime cutoff = java.time.LocalDateTime.now().minusSeconds(4);
+        var recent = submissionRepository.findFirstByUserIdAndProblemIdOrderBySubmittedAtDesc(user.getId(), problem.getId());
+        if (recent.isPresent()) {
+            Submission prev = recent.get();
+            if (prev.getSubmittedAt() != null && prev.getSubmittedAt().isAfter(cutoff)
+                    && prev.getLanguage() == request.language()
+                    && prev.getCode().equals(request.code())) {
+                return toResponse(prev);
+            }
+        }
+
         // Save as PENDING — the judge will update this asynchronously
         Submission submission = Submission.builder()
                 .user(user)
@@ -74,11 +86,19 @@ public class SubmissionService {
         submission = submissionRepository.save(submission);
 
         // Fire-and-forget: returns immediately, judging runs in background thread.
-        // Pass only the ID — JudgeService loads fresh data to avoid detached entity issues.
-        judgeService.judge(submission.getId());
+        // If queue is completely saturated, handle backpressure cleanly without crashing.
+        try {
+            judgeService.judge(submission.getId());
+        } catch (java.util.concurrent.RejectedExecutionException e) {
+            submission.setVerdict(Verdict.INTERNAL_ERROR);
+            submission.setErrorMessage("Judge capacity reached. Please retry in a few moments.");
+            submissionRepository.save(submission);
+        }
 
         return toResponse(submission);
     }
+
+
 
     /** Paginated list of the current user's own submissions. */
     @Transactional(readOnly = true)

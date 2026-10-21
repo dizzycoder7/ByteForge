@@ -46,6 +46,10 @@ public interface SubmissionRepository extends JpaRepository<Submission, Long> {
     Page<Submission> findByUserEmailWithProblem(
             @Param("email") String email, Pageable pageable);
 
+    /** Finds the latest submission by user and problem for deduplication / idempotency checks */
+    Optional<Submission> findFirstByUserIdAndProblemIdOrderBySubmittedAtDesc(Long userId, Long problemId);
+
+
     // ── Leaderboard ───────────────────────────────────────────────────────────
 
     /**

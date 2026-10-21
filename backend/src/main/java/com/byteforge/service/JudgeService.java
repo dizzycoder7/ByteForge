@@ -1,9 +1,11 @@
 package com.byteforge.service;
 
+import com.byteforge.dto.CompilerResponse;
 import com.byteforge.entity.Language;
 import com.byteforge.entity.Submission;
 import com.byteforge.entity.TestCase;
 import com.byteforge.entity.Verdict;
+import com.byteforge.judge.*;
 import com.byteforge.repository.SubmissionRepository;
 import com.byteforge.repository.TestCaseRepository;
 import lombok.RequiredArgsConstructor;
@@ -13,47 +15,18 @@ import org.springframework.stereotype.Service;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.*;
-import java.util.Arrays;
-import java.util.Comparator;
-import java.util.List;
-import java.util.UUID;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.stream.Collectors;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
- * The judging engine — compiles and executes user-submitted code against test cases.
- *
- * ─── How it works ────────────────────────────────────────────────────────────
- * 1. Load submission + test cases from DB (fresh transaction, avoids detached entity issues)
- * 2. Create an isolated temp directory per submission (UUID-based, thread-safe)
- * 3. Write code to file
- * 4. Compile (Java: javac, C++: g++, Python: skip)
- * 5. For each test case:
- *    a. Write input to input.txt
- *    b. Run the program with input.txt as stdin, capture output.txt + error.txt
- *    c. Compare output.txt to expectedOutput (normalized whitespace)
- *    d. Stop on first failure (fail-fast — same as real judges)
- * 6. Update submission verdict + executionTimeMs in DB
- * 7. Delete temp directory
- *
- * ─── Security note (Phase 4 TODO) ─────────────────────────────────────────
- * This implementation runs user code UNSANDBOXED on the host OS.
- * A malicious submission could: read files, make network calls, or fork-bomb.
- * Phase 4 will wrap execution in a Docker container with:
- *   - No network access
- *   - Read-only filesystem (except /tmp)
- *   - PID limits (no fork bombs)
- *   - Seccomp syscall filtering
- *
- * ─── @Async mechanics ─────────────────────────────────────────────────────
- * @Async("judgeExecutor") causes Spring to:
- *   1. Return immediately to the caller (SubmissionService)
- *   2. Submit this method body to the "judgeExecutor" thread pool
- * This works ONLY because JudgeService is a Spring-managed bean being called
- * from a DIFFERENT bean (SubmissionService) — Spring's proxy intercepts the call.
- * Calling @Async from within the same class bypasses the proxy and runs synchronously.
+ * The core judging engine — compiles and executes user-submitted code against test cases
+ * with strict process isolation, timeout enforcement, process tree cleanup,
+ * and comprehensive verdict attribution.
  */
 @Slf4j
 @Service
@@ -61,142 +34,278 @@ import java.util.stream.Collectors;
 public class JudgeService {
 
     private final SubmissionRepository submissionRepository;
-    private final TestCaseRepository   testCaseRepository;
+    private final TestCaseRepository testCaseRepository;
+    private final OutputChecker outputChecker;
 
-    // ─── Internal result records (private to this class) ────────────────────
+    private static final int MAX_OUTPUT_BYTES = 1024 * 1024; // 1MB output capture cap
+    private static final int MAX_ERROR_LEN = 2000;
 
-    private record CompileResult(boolean success, String errorOutput) {}
-    private record RunResult(Verdict verdict, String stdout, String stderr, long executionTimeMs) {}
+    // ─── Internal result records ─────────────────────────────────────────────
 
-    // ─── Entry point ─────────────────────────────────────────────────────────
+    private record CompileResult(boolean success, boolean isInfrastructureError, String errorOutput) {}
+    private record RunResult(Verdict verdict, String stdout, String stderr, long executionTimeMs, boolean isInfrastructureError) {}
+
+    // ─── Entry Point for Practice Submissions ─────────────────────────────────
 
     /**
      * Called by SubmissionService after saving a PENDING submission.
      * Runs asynchronously in the judgeExecutor thread pool.
-     *
-     * @param submissionId the ID of the saved submission to judge
      */
     @Async("judgeExecutor")
     public CompletableFuture<Void> judge(Long submissionId) {
-        log.info("[Judge] Starting — submissionId={}", submissionId);
+        log.info("[Judge] Starting judging for submissionId={}", submissionId);
 
-        // Load fresh from DB (new implicit transaction per repository call)
-        // JOIN FETCH ensures problem.timeLimitMs is accessible without lazy-load exception
         Submission submission = submissionRepository.findByIdWithDetails(submissionId)
                 .orElseThrow(() -> new IllegalStateException("Submission not found: " + submissionId));
+
+        // State transition: PENDING -> RUNNING
+        submission.setVerdict(Verdict.RUNNING);
+        submissionRepository.save(submission);
 
         List<TestCase> testCases = testCaseRepository
                 .findByProblemIdOrderByOrderIndexAsc(submission.getProblem().getId());
 
-        Verdict finalVerdict  = Verdict.ACCEPTED;
-        long    maxTimeMs     = 0L;
-        String  errorMessage  = null;
-        Path    tempDir       = null;
-
-        try {
-            // ── Step 1: Setup temp workspace ──────────────────────────────────
-            tempDir = createTempDir(submissionId);
-
-            // ── Step 2: Write source code to file ─────────────────────────────
-            writeCodeFile(tempDir, submission);
-
-            // ── Step 3: Compile (Java / C++) ──────────────────────────────────
-            CompileResult compileResult = compile(tempDir, submission.getLanguage());
-
-            if (!compileResult.success()) {
-                finalVerdict = Verdict.COMPILATION_ERROR;
-                errorMessage = truncate(compileResult.errorOutput(), 2000);
-                log.info("[Judge] CE — submissionId={}", submissionId);
-
-            } else {
-
-                // ── Step 4: Run against each test case ────────────────────────
-                int timeLimitMs = submission.getProblem().getTimeLimitMs();
-
-                if (testCases.isEmpty()) {
-                    log.warn("[Judge] No test cases for problemId={} — marking AC by default",
-                            submission.getProblem().getId());
-                }
-
-                for (TestCase tc : testCases) {
-                    RunResult result = runTestCase(tempDir, submission.getLanguage(),
-                            tc.getInputData(), timeLimitMs);
-                    maxTimeMs = Math.max(maxTimeMs, result.executionTimeMs());
-
-                    if (result.verdict() == Verdict.TIME_LIMIT_EXCEEDED) {
-                        finalVerdict = Verdict.TIME_LIMIT_EXCEEDED;
-                        break;
-                    } else if (result.verdict() == Verdict.RUNTIME_ERROR) {
-                        finalVerdict = Verdict.RUNTIME_ERROR;
-                        errorMessage = truncate(result.stderr(), 2000);
-                        break;
-                    } else if (!outputMatches(result.stdout(), tc.getExpectedOutput())) {
-                        finalVerdict = Verdict.WRONG_ANSWER;
-                        break;
-                    }
-                    // else: this test case passed — continue to next
-                }
-            }
-
-        } catch (Exception e) {
-            log.error("[Judge] Unexpected error — submissionId={}", submissionId, e);
-            finalVerdict = Verdict.RUNTIME_ERROR;
-            errorMessage = "Internal judge error: " + e.getMessage();
-
-        } finally {
-            // ── Step 5: Cleanup temp directory ───────────────────────────────
-            deleteDir(tempDir);
+        if (testCases == null || testCases.isEmpty()) {
+            log.error("[Judge] No test cases found for problemId={} — setting INTERNAL_ERROR (never false AC)",
+                    submission.getProblem().getId());
+            submission.setVerdict(Verdict.INTERNAL_ERROR);
+            submission.setErrorMessage("Internal judge error: No test cases configured for this problem");
+            submission.setExecutionTimeMs(0L);
+            submissionRepository.save(submission);
+            return CompletableFuture.completedFuture(null);
         }
 
-        // ── Step 6: Persist the final verdict ────────────────────────────────
-        submission.setVerdict(finalVerdict);
-        submission.setExecutionTimeMs(maxTimeMs);
-        submission.setErrorMessage(errorMessage);
+        List<TestCasePair> pairs = new ArrayList<>(testCases.size());
+        for (int i = 0; i < testCases.size(); i++) {
+            TestCase tc = testCases.get(i);
+            pairs.add(new TestCasePair(i + 1, tc.getInputData(), tc.getExpectedOutput(), tc.isSample()));
+        }
+
+        int timeLimitMs = submission.getProblem().getTimeLimitMs() > 0
+                ? submission.getProblem().getTimeLimitMs() : 2000;
+
+        SubmissionEvaluation evaluation = evaluateCode(
+                submission.getCode(),
+                submission.getLanguage(),
+                pairs,
+                timeLimitMs,
+                100,
+                ComparisonPolicy.NORMALIZED_WHITESPACE,
+                true // fail-fast on first error for standard competitive programming practice
+        );
+
+        submission.setVerdict(evaluation.verdict());
+        submission.setExecutionTimeMs(evaluation.maxExecutionTimeMs());
+        submission.setErrorMessage(evaluation.errorMessage());
         submissionRepository.save(submission);
 
-        log.info("[Judge] Done — submissionId={}, verdict={}, timeMs={}",
-                submissionId, finalVerdict, maxTimeMs);
+        log.info("[Judge] Completed submissionId={}, verdict={}, timeMs={}",
+                submissionId, evaluation.verdict(), evaluation.maxExecutionTimeMs());
 
         return CompletableFuture.completedFuture(null);
     }
 
+    // ─── General Code Evaluation Suite (Used by Practice & Assessments) ───────
+
     /**
-     * Executes arbitrary code against custom stdin input for the Online Compiler / IDE.
-     * Synchronous and standalone — does not create a database submission record.
+     * Evaluates code against a suite of test cases.
+     *
+     * @param code source code
+     * @param language programming language
+     * @param testCases test cases to execute
+     * @param timeLimitMs time limit per test case in milliseconds
+     * @param maxPoints maximum marks available for this problem
+     * @param policy output comparison policy
+     * @param failFast if true, stops execution upon encountering first failing test
+     * @return comprehensive SubmissionEvaluation
      */
-    public com.byteforge.dto.CompilerResponse runCustomCode(String code, Language language, String input) {
+    public SubmissionEvaluation evaluateCode(
+            String code,
+            Language language,
+            List<TestCasePair> testCases,
+            int timeLimitMs,
+            int maxPoints,
+            ComparisonPolicy policy,
+            boolean failFast
+    ) {
+        if (testCases == null || testCases.isEmpty()) {
+            return new SubmissionEvaluation(
+                    Verdict.INTERNAL_ERROR,
+                    "INTERNAL_ERROR (No Test Cases)",
+                    0,
+                    maxPoints,
+                    0,
+                    0,
+                    0L,
+                    "No test cases available for evaluation",
+                    List.of()
+            );
+        }
+
         Path tempDir = null;
         try {
-            tempDir = createTempDir(System.currentTimeMillis());
+            tempDir = createTempDir(System.nanoTime());
 
-            // Write code
-            String filename;
-            if (language == Language.JAVA) {
-                filename = (code != null && code.contains("class Main")) ? "Main.java" : "Solution.java";
-            } else {
-                filename = switch (language) {
-                    case CPP    -> "solution.cpp";
-                    case PYTHON -> "solution.py";
-                    default     -> "Solution.java";
-                };
-            }
-            Files.writeString(tempDir.resolve(filename), code, StandardCharsets.UTF_8);
+            // 1. Write Code to Source File
+            String sourceFilename = writeCodeFile(tempDir, code, language);
 
-            // Compile
-            CompileResult compileResult = compile(tempDir, language);
+            // 2. Compile (Java, C, C++)
+            CompileResult compileResult = compile(tempDir, language, sourceFilename);
             if (!compileResult.success()) {
-                return new com.byteforge.dto.CompilerResponse(
+                if (compileResult.isInfrastructureError()) {
+                    return new SubmissionEvaluation(
+                            Verdict.INTERNAL_ERROR,
+                            "INTERNAL_ERROR (Compiler Unavailable)",
+                            0,
+                            maxPoints,
+                            testCases.size(),
+                            0,
+                            0L,
+                            compileResult.errorOutput(),
+                            List.of()
+                    );
+                }
+
+                String cleanError = sanitizeErrorMessage(compileResult.errorOutput(), tempDir);
+                return new SubmissionEvaluation(
+                        Verdict.COMPILATION_ERROR,
+                        "COMPILATION_ERROR (0/" + testCases.size() + " Passed)",
+                        0,
+                        maxPoints,
+                        testCases.size(),
+                        0,
+                        0L,
+                        truncate(cleanError, MAX_ERROR_LEN),
+                        List.of()
+                );
+            }
+
+            // 3. Execute Against Test Cases
+            List<TestCaseResult> results = new ArrayList<>();
+            long maxTimeMs = 0L;
+            Verdict firstFailureVerdict = null;
+            String failureMessage = null;
+            int passedCount = 0;
+
+            for (TestCasePair tc : testCases) {
+                RunResult runResult = runTestCase(tempDir, language, sourceFilename, tc.inputData(), timeLimitMs);
+                maxTimeMs = Math.max(maxTimeMs, runResult.executionTimeMs());
+
+                if (runResult.isInfrastructureError()) {
+                    firstFailureVerdict = Verdict.INTERNAL_ERROR;
+                    failureMessage = runResult.stderr();
+                    results.add(TestCaseResult.fail(tc.index(), Verdict.INTERNAL_ERROR, runResult.executionTimeMs(), runResult.stderr()));
+                    if (failFast) break;
+                    continue;
+                }
+
+                if (runResult.verdict() == Verdict.TIME_LIMIT_EXCEEDED) {
+                    if (firstFailureVerdict == null) {
+                        firstFailureVerdict = Verdict.TIME_LIMIT_EXCEEDED;
+                        failureMessage = "Time Limit Exceeded (" + runResult.executionTimeMs() + "ms > " + timeLimitMs + "ms)";
+                    }
+                    results.add(TestCaseResult.fail(tc.index(), Verdict.TIME_LIMIT_EXCEEDED, runResult.executionTimeMs(), "Time Limit Exceeded"));
+                    if (failFast) break;
+                    continue;
+                }
+
+                if (runResult.verdict() == Verdict.RUNTIME_ERROR) {
+                    if (firstFailureVerdict == null) {
+                        firstFailureVerdict = Verdict.RUNTIME_ERROR;
+                        failureMessage = runResult.stderr();
+                    }
+                    results.add(TestCaseResult.fail(tc.index(), Verdict.RUNTIME_ERROR, runResult.executionTimeMs(), runResult.stderr()));
+                    if (failFast) break;
+                    continue;
+                }
+
+                // Check output matching
+                ComparisonResult comp = outputChecker.compare(runResult.stdout(), tc.expectedOutput(), policy);
+                if (comp.matched()) {
+                    passedCount++;
+                    results.add(TestCaseResult.pass(tc.index(), runResult.executionTimeMs()));
+                } else {
+                    if (firstFailureVerdict == null) {
+                        firstFailureVerdict = Verdict.WRONG_ANSWER;
+                        failureMessage = comp.diffMessage();
+                    }
+                    results.add(TestCaseResult.fail(tc.index(), Verdict.WRONG_ANSWER, runResult.executionTimeMs(), comp.diffMessage()));
+                    if (failFast) break;
+                }
+            }
+
+            // 4. Calculate Final Score & Verdict
+            int total = testCases.size();
+            Verdict finalVerdict = (passedCount == total) ? Verdict.ACCEPTED : (firstFailureVerdict != null ? firstFailureVerdict : Verdict.WRONG_ANSWER);
+
+            // Deterministic score computation
+            int calculatedScore;
+            if (passedCount == total) {
+                calculatedScore = maxPoints;
+            } else if (passedCount == 0) {
+                calculatedScore = 0;
+            } else {
+                calculatedScore = (int) Math.round(((double) passedCount / total) * maxPoints);
+            }
+
+            String detailedVerdict = String.format("%s (%d/%d Testcases Passed)", finalVerdict.name(), passedCount, total);
+
+            return new SubmissionEvaluation(
+                    finalVerdict,
+                    detailedVerdict,
+                    calculatedScore,
+                    maxPoints,
+                    total,
+                    passedCount,
+                    maxTimeMs,
+                    truncate(failureMessage, MAX_ERROR_LEN),
+                    results
+            );
+
+        } catch (Exception e) {
+            log.error("[Judge] Unexpected execution error", e);
+            return new SubmissionEvaluation(
+                    Verdict.INTERNAL_ERROR,
+                    "INTERNAL_ERROR (Evaluation Fault)",
+                    0,
+                    maxPoints,
+                    testCases.size(),
+                    0,
+                    0L,
+                    "Internal judge evaluation error: " + e.getMessage(),
+                    List.of()
+            );
+        } finally {
+            deleteDir(tempDir);
+        }
+    }
+
+    // ─── Online Compiler / Sandbox Runner ─────────────────────────────────────
+
+    /**
+     * Executes arbitrary code against custom input for the Online Compiler / IDE.
+     * Synchronous and standalone — does not modify database.
+     */
+    public CompilerResponse runCustomCode(String code, Language language, String input) {
+        Path tempDir = null;
+        try {
+            tempDir = createTempDir(System.nanoTime());
+
+            String sourceFilename = writeCodeFile(tempDir, code, language);
+
+            CompileResult compileResult = compile(tempDir, language, sourceFilename);
+            if (!compileResult.success()) {
+                return new CompilerResponse(
                         "",
-                        compileResult.errorOutput(),
-                        "COMPILATION_ERROR",
+                        sanitizeErrorMessage(compileResult.errorOutput(), tempDir),
+                        compileResult.isInfrastructureError() ? "INTERNAL_ERROR" : "COMPILATION_ERROR",
                         0L
                 );
             }
 
-            // Run with 5000ms max timeout for interactive sandbox
-            RunResult result = runTestCase(tempDir, language, input != null ? input : "", 5000);
+            RunResult result = runTestCase(tempDir, language, sourceFilename, input != null ? input : "", 5000);
 
-            return new com.byteforge.dto.CompilerResponse(
+            return new CompilerResponse(
                     result.stdout(),
                     result.stderr(),
                     result.verdict().name(),
@@ -205,10 +314,10 @@ public class JudgeService {
 
         } catch (Exception e) {
             log.error("[Compiler] Error executing custom code", e);
-            return new com.byteforge.dto.CompilerResponse(
+            return new CompilerResponse(
                     "",
                     "Execution error: " + e.getMessage(),
-                    "RUNTIME_ERROR",
+                    "INTERNAL_ERROR",
                     0L
             );
         } finally {
@@ -216,102 +325,115 @@ public class JudgeService {
         }
     }
 
-    // ─── Temp directory helpers ──────────────────────────────────────────────
+    // ─── Compilation & Execution Helpers ─────────────────────────────────────
 
-    private Path createTempDir(Long submissionId) throws IOException {
-        String name = "byteforge_" + submissionId + "_" + UUID.randomUUID();
+    private Path createTempDir(long identifier) throws IOException {
+        String name = "byteforge_" + identifier + "_" + UUID.randomUUID();
         Path dir = Path.of(System.getProperty("java.io.tmpdir"), name);
         Files.createDirectories(dir);
         return dir;
     }
 
-    private String detectJavaClassName(Path dir) {
-        if (Files.exists(dir.resolve("Main.java"))) return "Main";
+    private String detectJavaClassName(String code) {
+        if (code != null) {
+            Matcher m = Pattern.compile("(?:public\\s+)?class\\s+([A-Za-z0-9_]+)").matcher(code);
+            if (m.find()) {
+                return m.group(1);
+            }
+        }
         return "Solution";
     }
 
-    private void writeCodeFile(Path dir, Submission submission) throws IOException {
+    private String getBinaryName(String baseName) {
+        if (System.getProperty("os.name").toLowerCase().contains("win")) {
+            return baseName + ".exe";
+        }
+        return baseName;
+    }
+
+    private String writeCodeFile(Path dir, String code, Language language) throws IOException {
         String filename;
-        if (submission.getLanguage() == Language.JAVA) {
-            filename = (submission.getCode() != null && submission.getCode().contains("class Main")) ? "Main.java" : "Solution.java";
+        if (language == Language.JAVA) {
+            String className = detectJavaClassName(code);
+            filename = className + ".java";
         } else {
-            filename = switch (submission.getLanguage()) {
+            filename = switch (language) {
+                case C      -> "solution.c";
                 case CPP    -> "solution.cpp";
                 case PYTHON -> "solution.py";
                 default     -> "Solution.java";
             };
         }
-        Files.writeString(dir.resolve(filename), submission.getCode(), StandardCharsets.UTF_8);
+        Files.writeString(dir.resolve(filename), code != null ? code : "", StandardCharsets.UTF_8);
+        return filename;
     }
 
-    // ─── Compilation ─────────────────────────────────────────────────────────
-
-    /**
-     * Compiles the code. Python needs no compilation, so returns success immediately.
-     * For Java and C++, runs the compiler and checks exit code.
-     *
-     * stdout+stderr are merged via redirectErrorStream(true) so compiler errors
-     * (which go to stderr) are captured in the result's errorOutput field.
-     */
-    private CompileResult compile(Path dir, Language language) throws IOException, InterruptedException {
-        String javaFile = Files.exists(dir.resolve("Main.java")) ? "Main.java" : "Solution.java";
+    private CompileResult compile(Path dir, Language language, String sourceFilename) throws InterruptedException {
+        String binaryName = getBinaryName("solution");
         List<String> command = switch (language) {
-            case JAVA   -> List.of("javac", dir.resolve(javaFile).toString());
-            case CPP    -> List.of("g++", "-O2", "-o",
-                                   dir.resolve("solution").toString(),
-                                   dir.resolve("solution.cpp").toString());
-            case PYTHON -> List.of(); // no compilation step
+            case JAVA   -> List.of("javac", dir.resolve(sourceFilename).toString());
+            case CPP    -> List.of("g++", "-O2", "-o", dir.resolve(binaryName).toString(), dir.resolve(sourceFilename).toString());
+            case C      -> List.of("gcc", "-O2", "-o", dir.resolve(binaryName).toString(), dir.resolve(sourceFilename).toString());
+            case PYTHON -> List.of(); // Interpreted — no compile step
         };
 
         if (command.isEmpty()) {
-            return new CompileResult(true, "");
+            return new CompileResult(true, false, "");
         }
 
         try {
             Process process = new ProcessBuilder(command)
                     .directory(dir.toFile())
-                    .redirectErrorStream(true) // merge stderr (compiler errors) into stdout
+                    .redirectErrorStream(true)
                     .start();
 
-            String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-            int exitCode  = process.waitFor();
+            boolean finished = process.waitFor(15, TimeUnit.SECONDS);
+            if (!finished) {
+                terminateProcessTree(process);
+                return new CompileResult(false, false, "Compilation timed out after 15 seconds.");
+            }
 
-            return new CompileResult(exitCode == 0, sanitizeErrorMessage(output, dir));
+            String output = readLimitedOutput(process.getInputStream());
+            int exitCode = process.exitValue();
+
+            return new CompileResult(exitCode == 0, false, sanitizeErrorMessage(output, dir));
         } catch (IOException e) {
-            log.warn("[Judge] Compiler binary not found: {}", e.getMessage());
-            return new CompileResult(false, "Compiler invocation failed: " + e.getMessage() + "\n(Please ensure 'javac' or 'g++' is installed and in your system PATH)");
+            log.warn("[Judge] Compiler executable not accessible for command {}: {}", command.get(0), e.getMessage());
+            return new CompileResult(false, true,
+                    "Judge Infrastructure Warning: Compiler binary '" + command.get(0) + "' was not found or could not be invoked.\n"
+                    + "Diagnostic details: " + e.getMessage());
         }
     }
 
-    // ─── Execution ───────────────────────────────────────────────────────────
+    private RunResult runTestCase(
+            Path dir,
+            Language language,
+            String sourceFilename,
+            String input,
+            int timeLimitMs
+    ) throws IOException, InterruptedException {
 
-    /**
-     * Runs the compiled program against one test case.
-     *
-     * I/O strategy: redirect stdin/stdout/stderr to FILES rather than streams.
-     * This avoids the classic ProcessBuilder deadlock where stdout fills its OS
-     * buffer while we're waiting for the process — the process blocks writing,
-     * we block waiting, neither makes progress.
-     *
-     * Timeout: process.waitFor(timeLimitMs) returns false if time expires.
-     * We then destroyForcibly() to kill the process tree and return TLE.
-     */
-    private RunResult runTestCase(Path dir, Language language,
-                                  String input, int timeLimitMs)
-            throws IOException, InterruptedException {
-
-        // Write input to file → avoids stdin stream management entirely
         Path inputFile  = dir.resolve("input.txt");
         Path outputFile = dir.resolve("output.txt");
         Path errorFile  = dir.resolve("error.txt");
-        Files.writeString(inputFile, input, StandardCharsets.UTF_8);
 
-        String javaClass = detectJavaClassName(dir);
-        List<String> command = switch (language) {
-            case JAVA   -> List.of("java", "-cp", dir.toString(), javaClass);
-            case CPP    -> List.of(dir.resolve("solution").toString());
-            case PYTHON -> List.of("python", dir.resolve("solution.py").toString());
-        };
+        Files.writeString(inputFile, input != null ? input : "", StandardCharsets.UTF_8);
+
+        List<String> command;
+        if (language == Language.JAVA) {
+            String javaClass = sourceFilename.endsWith(".java")
+                    ? sourceFilename.substring(0, sourceFilename.length() - 5)
+                    : "Solution";
+            command = List.of("java", "-cp", dir.toString(), javaClass);
+        } else if (language == Language.CPP || language == Language.C) {
+            Path binPath = dir.resolve(getBinaryName("solution"));
+            command = List.of(binPath.toString());
+        } else if (language == Language.PYTHON) {
+            String pyCmd = resolvePythonCommand();
+            command = List.of(pyCmd, dir.resolve(sourceFilename).toString());
+        } else {
+            return new RunResult(Verdict.INTERNAL_ERROR, "", "Unsupported language: " + language, 0L, true);
+        }
 
         ProcessBuilder pb = new ProcessBuilder(command)
                 .directory(dir.toFile())
@@ -320,69 +442,90 @@ public class JudgeService {
                 .redirectError(errorFile.toFile());
 
         long startTime = System.currentTimeMillis();
-        Process process = pb.start();
-
-        boolean finished = process.waitFor(timeLimitMs, TimeUnit.MILLISECONDS);
-        long elapsedMs   = System.currentTimeMillis() - startTime;
-
-        if (!finished) {
-            process.destroyForcibly();
-            return new RunResult(Verdict.TIME_LIMIT_EXCEEDED, "", "", elapsedMs);
+        Process process;
+        try {
+            process = pb.start();
+        } catch (IOException e) {
+            log.warn("[Judge] Failed to launch execution process for {}: {}", command.get(0), e.getMessage());
+            return new RunResult(Verdict.INTERNAL_ERROR, "",
+                    "Judge Infrastructure Error: Cannot execute runtime program '" + command.get(0) + "': " + e.getMessage(),
+                    0L, true);
         }
 
-        // Read captured output files
-        String stdout = Files.exists(outputFile)
-                ? Files.readString(outputFile, StandardCharsets.UTF_8) : "";
-        String stderr = Files.exists(errorFile)
-                ? Files.readString(errorFile, StandardCharsets.UTF_8) : "";
+        boolean finished = process.waitFor(timeLimitMs, TimeUnit.MILLISECONDS);
+        long elapsedMs = System.currentTimeMillis() - startTime;
+
+        if (!finished) {
+            terminateProcessTree(process);
+            return new RunResult(Verdict.TIME_LIMIT_EXCEEDED, "", "", elapsedMs, false);
+        }
+
+        String stdout = readLimitedOutput(outputFile);
+        String stderr = readLimitedOutput(errorFile);
 
         stderr = sanitizeErrorMessage(stderr, dir);
 
         int exitCode = process.exitValue();
         if (exitCode != 0) {
-            return new RunResult(Verdict.RUNTIME_ERROR, stdout, stderr, elapsedMs);
+            return new RunResult(Verdict.RUNTIME_ERROR, stdout, stderr, elapsedMs, false);
         }
 
-        return new RunResult(Verdict.ACCEPTED, stdout, stderr, elapsedMs);
+        return new RunResult(Verdict.ACCEPTED, stdout, stderr, elapsedMs, false);
     }
 
-    // ─── Output comparison ────────────────────────────────────────────────────
+    // ─── Process & Resource Safety Helpers ────────────────────────────────────
 
-    /**
-     * Normalizes and compares actual vs expected output.
-     *
-     * Normalization rules (standard in CP judges):
-     *   1. Split by line (handles both \n and \r\n)
-     *   2. Strip trailing whitespace from each line
-     *   3. Remove trailing empty lines
-     *
-     * This means " 5 \n" matches "5\n" — a common source of WA for beginners
-     * if we didn't normalize.
-     */
-    private boolean outputMatches(String actual, String expected) {
-        return normalize(actual).equals(normalize(expected));
+    private void terminateProcessTree(Process process) {
+        if (process == null) return;
+        try {
+            process.descendants().forEach(ProcessHandle::destroyForcibly);
+        } catch (Exception ignored) {}
+        process.destroyForcibly();
+        try {
+            process.waitFor(500, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException ignored) {
+            Thread.currentThread().interrupt();
+        }
     }
 
-    private String normalize(String text) {
-        if (text == null || text.isBlank()) return "";
-        return Arrays.stream(text.split("\\r?\\n"))
-                .map(String::stripTrailing)
-                .collect(Collectors.joining("\n"))
-                .stripTrailing();
+    private String readLimitedOutput(Path file) throws IOException {
+        if (!Files.exists(file)) return "";
+        long size = Files.size(file);
+        if (size > MAX_OUTPUT_BYTES) {
+            try (var is = Files.newInputStream(file)) {
+                byte[] bytes = is.readNBytes(MAX_OUTPUT_BYTES);
+                return new String(bytes, StandardCharsets.UTF_8) + "\n...[Output Truncated: Exceeded 1MB Limit]";
+            }
+        }
+        return Files.readString(file, StandardCharsets.UTF_8);
     }
 
-    // ─── Utilities ───────────────────────────────────────────────────────────
+    private String readLimitedOutput(java.io.InputStream stream) throws IOException {
+        byte[] bytes = stream.readNBytes(MAX_OUTPUT_BYTES);
+        return new String(bytes, StandardCharsets.UTF_8);
+    }
 
-    /**
-     * Filters temporary OS file system paths (e.g. C:\Users\...\Temp\byteforge_123\)
-     * into clean, readable LeetCode-style compiler error messages (e.g. "Line 14: error: ...").
-     */
-    private String sanitizeErrorMessage(String output, Path dir) {
+    private String resolvePythonCommand() {
+        boolean isWin = System.getProperty("os.name").toLowerCase().contains("win");
+        String[] candidates = isWin
+                ? new String[]{"python", "python3", "py"}
+                : new String[]{"python3", "python"};
+
+        for (String cmd : candidates) {
+            try {
+                Process p = new ProcessBuilder(cmd, "--version").start();
+                if (p.waitFor(1200, TimeUnit.MILLISECONDS) && p.exitValue() == 0) {
+                    return cmd;
+                }
+            } catch (Exception ignored) {}
+        }
+        return candidates[0];
+    }
+
+    public String sanitizeErrorMessage(String output, Path dir) {
         if (output == null || output.isBlank()) return "";
 
         String result = output;
-
-        // 1. Remove the specific temp directory path
         if (dir != null) {
             String dirPath = dir.toString();
             result = result.replace(dirPath + "\\", "")
@@ -390,33 +533,32 @@ public class JudgeService {
                            .replace(dirPath, "");
         }
 
-        // 2. Strip standard OS temp paths / UUID directory prefixes
         result = result.replaceAll("(?i)[a-z]:\\\\[^\\n\\r:]*byteforge_[^\\n\\r:\\\\/]+[\\\\/]", "");
         result = result.replaceAll("/[^\\n\\r:]*byteforge_[^\\n\\r:\\\\/]+/", "");
-
-        // 3. Format Java / C++ file prefixes into clean "Line X:" format like LeetCode
-        result = result.replaceAll("(?i)(Main\\.java|Solution\\.java|solution\\.cpp):([0-9]+):([0-9]+):", "Line $2:$3:");
-        result = result.replaceAll("(?i)(Main\\.java|Solution\\.java|solution\\.cpp):([0-9]+):", "Line $2:");
+        result = result.replaceAll("(?i)(Main\\.java|Solution\\.java|solution\\.cpp|solution\\.c):([0-9]+):([0-9]+):", "Line $2:$3:");
+        result = result.replaceAll("(?i)(Main\\.java|Solution\\.java|solution\\.cpp|solution\\.c):([0-9]+):", "Line $2:");
 
         return result.trim();
     }
 
-    /** Cap error messages stored in DB to avoid bloating the column. */
     private String truncate(String text, int maxLen) {
         if (text == null) return null;
         return text.length() <= maxLen ? text : text.substring(0, maxLen) + "...[truncated]";
     }
 
-    /** Recursively delete a directory tree — called in finally block. */
     private void deleteDir(Path dir) {
-        if (dir == null) return;
-        try {
-            Files.walk(dir)
-                 .sorted(Comparator.reverseOrder())
-                 .forEach(p -> {
-                     try { Files.deleteIfExists(p); }
-                     catch (IOException ignored) {}
-                 });
-        } catch (IOException ignored) {}
+        if (dir == null || !Files.exists(dir)) return;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            try {
+                Files.walk(dir)
+                     .sorted(Comparator.reverseOrder())
+                     .forEach(p -> {
+                         try { Files.deleteIfExists(p); }
+                         catch (IOException ignored) {}
+                     });
+                if (!Files.exists(dir)) break;
+            } catch (IOException ignored) {}
+            try { Thread.sleep(50); } catch (InterruptedException ignored) {}
+        }
     }
 }

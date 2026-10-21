@@ -319,31 +319,61 @@ export default function StudentAssessmentTestPage() {
     }
   }
 
-  // Final Assessment Submit
+  const [submissionResults, setSubmissionResults] = useState([])
+
+  // Final Assessment Submit — evaluates and records all problems attempted during exam
   const handleFinalSubmit = async () => {
     setSubmittingTest(true)
+    const updatedCodes = {
+      ...userCodes,
+      [`${activeQuestion}_${language}`]: code,
+    }
+
     try {
-      await api.post(`/college/assessments/${id}/submissions`, {
-        assessmentId: parseInt(id, 10),
-        studentName: user?.username ? user.username.toUpperCase() : 'Student Coder',
-        studentHandle: user?.username || 'student_user',
-        rollNo: '2023CSB' + ((user?.id || 1) * 104),
-        problemTitle: q?.title || 'Practical Assessment Task',
-        language,
-        sourceCode: code,
-        score: warnings === 0 ? 100 : Math.max(70, 100 - (warnings * 10)),
-        verdict: 'ACCEPTED (10/10 Testcases Passed)',
-        tabSwitchFlags: warnings,
-        timeTaken: '42 mins',
+      const itemsToSubmit = questions.length > 0 ? questions : [{ title: q?.title || 'Practical Assessment Task' }]
+      const payload = itemsToSubmit.map((item, idx) => {
+        const itemCode = updatedCodes[`${idx}_${language}`] || (idx === activeQuestion ? code : '')
+        return {
+          assessmentId: parseInt(id, 10),
+          studentName: user?.username ? user.username.toUpperCase() : 'Student Coder',
+          studentHandle: user?.username || 'student_user',
+          rollNo: '2023CSB' + ((user?.id || 1) * 104),
+          problemTitle: item?.title || `Problem ${idx + 1}`,
+          language,
+          sourceCode: itemCode || '// No code submitted',
+          tabSwitchFlags: warnings,
+          timeTaken: '42 mins',
+        }
       })
+
+      const { data } = await api.post(`/college/assessments/${id}/submissions/batch`, payload)
+      setSubmissionResults(Array.isArray(data) ? data : [data])
       setSubmitted(true)
     } catch (err) {
       console.error('Failed to record submission', err)
+      // Fallback single submit in case of network issue
+      try {
+        const { data } = await api.post(`/college/assessments/${id}/submissions`, {
+          assessmentId: parseInt(id, 10),
+          studentName: user?.username ? user.username.toUpperCase() : 'Student Coder',
+          studentHandle: user?.username || 'student_user',
+          rollNo: '2023CSB' + ((user?.id || 1) * 104),
+          problemTitle: q?.title || 'Practical Assessment Task',
+          language,
+          sourceCode: code,
+          tabSwitchFlags: warnings,
+          timeTaken: '42 mins',
+        })
+        setSubmissionResults(data ? [data] : [])
+      } catch (e) {
+        console.error('Fallback submit also failed', e)
+      }
       setSubmitted(true)
     } finally {
       setSubmittingTest(false)
     }
   }
+
 
   // Helper to check institutional authorization
   const normalizeCollege = (name) => (name || '').toLowerCase().replace(/[^a-z0-9]/g, '')
@@ -461,7 +491,20 @@ export default function StudentAssessmentTestPage() {
               <span>Proctoring Integrity:</span>
               <span className="text-yellow-400 font-bold">{warnings} Tab switches flagged</span>
             </div>
+            {submissionResults && submissionResults.length > 0 && (
+              <div className="pt-2 border-t border-gray-800 space-y-1.5">
+                <div className="text-[10px] text-gray-400 font-bold uppercase tracking-wider">Evaluation Results:</div>
+                {submissionResults.map((r, i) => (
+                  <div key={i} className="flex justify-between items-center bg-[#070b14] px-2.5 py-1.5 rounded-lg border border-gray-800">
+                    <span className="text-gray-300 font-medium truncate max-w-[160px] text-[11px]">{r.problemTitle}</span>
+                    <span className="text-amber-400 font-bold text-[11px]">{r.score} Pts</span>
+                    <span className="text-emerald-400 font-mono text-[10px]">{r.verdict}</span>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
+
 
           <Link
             to="/assessments"

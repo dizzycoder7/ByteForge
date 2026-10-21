@@ -266,6 +266,7 @@ public class DataInitializer implements CommandLineRunner {
                             .outputFormat("Inverted tree array in level order representation: e.g. [4,7,2,9,6,3,1]")
                             .sampleInput("[4, 2, 7, 1, 3, 6, 9]")
                             .sampleOutput("[4, 7, 2, 9, 6, 3, 1]")
+                            .hiddenTestCasesJson("[{\"input\":\"[2, 1, 3]\",\"output\":\"[2, 3, 1]\"},{\"input\":\"[]\",\"output\":\"[]\"}]")
                             .orderIndex(1)
                             .build());
 
@@ -280,8 +281,10 @@ public class DataInitializer implements CommandLineRunner {
                             .outputFormat("Maximum contiguous subarray sum: e.g. 6")
                             .sampleInput("[-2, 1, -3, 4, -1, 2, 1, -5, 4]")
                             .sampleOutput("6")
+                            .hiddenTestCasesJson("[{\"input\":\"[1]\",\"output\":\"1\"},{\"input\":\"[5, 4, -1, 7, 8]\",\"output\":\"23\"}]")
                             .orderIndex(2)
                             .build());
+
                 }
             });
             log.info("[DataInitializer] Seeded sample AssessmentProblems for college assessments.");

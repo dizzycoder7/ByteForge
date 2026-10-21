@@ -1,36 +1,22 @@
 package com.byteforge.config;
 
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.scheduling.annotation.EnableAsync;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 
 import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionHandler;
 import java.util.concurrent.ThreadPoolExecutor;
 
 /**
- * Configures the thread pool used by @Async judge tasks.
+ * Thread pool configuration for asynchronous online judging.
  *
- * Why a dedicated thread pool instead of Spring's default SimpleAsyncTaskExecutor?
- *   SimpleAsyncTaskExecutor creates a new thread per task — unbounded. Under high
- *   submission load this would spawn thousands of threads, exhausting memory.
- *   A bounded ThreadPoolTaskExecutor lets us control concurrency explicitly.
- *
- * Pool parameters:
- *   corePoolSize  = 2  → always-alive threads for judging
- *   maxPoolSize   = 5  → burst capacity (up to 5 concurrent judgements)
- *   queueCapacity = 50 → submissions wait here if all 5 threads are busy
- *
- * RejectedExecutionHandler = CallerRunsPolicy:
- *   If the queue is full AND all threads are busy, the submission thread itself
- *   runs the judging task synchronously. This provides natural backpressure —
- *   the API slows down instead of rejecting requests outright.
- *
- * Interview insight: This is a classic producer-consumer problem.
- *   Submissions = producers, judge threads = consumers, queue = buffer.
- *   In production (Codeforces/LeetCode scale), this queue becomes a full
- *   message broker like Kafka or RabbitMQ.
+ * Configured with bounded concurrency and explicit backpressure to prevent
+ * Tomcat HTTP request thread exhaustion under high assessment traffic.
  */
+@Slf4j
 @Configuration
 @EnableAsync
 public class AsyncConfig {
@@ -38,11 +24,24 @@ public class AsyncConfig {
     @Bean(name = "judgeExecutor")
     public Executor judgeExecutor() {
         ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
-        executor.setCorePoolSize(2);
-        executor.setMaxPoolSize(5);
-        executor.setQueueCapacity(50);
+        executor.setCorePoolSize(4);
+        executor.setMaxPoolSize(10);
+        executor.setQueueCapacity(200);
         executor.setThreadNamePrefix("ByteForge-Judge-");
-        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+
+        // Custom RejectedExecutionHandler: Logs saturation and prevents Tomcat thread starvation.
+        // Instead of CallerRunsPolicy (which forces HTTP threads to compile/run untrusted code),
+        // we reject with backpressure diagnostics.
+        executor.setRejectedExecutionHandler(new RejectedExecutionHandler() {
+            @Override
+            public void rejectedExecution(Runnable r, ThreadPoolExecutor e) {
+                log.error("[JudgeExecutor] Queue saturated! Active: {}, QueueSize: {}. Applying backpressure.",
+                        e.getActiveCount(), e.getQueue().size());
+                throw new java.util.concurrent.RejectedExecutionException(
+                        "ByteForge judge queue is currently at maximum capacity. Please retry shortly.");
+            }
+        });
+
         executor.initialize();
         return executor;
     }
