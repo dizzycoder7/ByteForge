@@ -112,10 +112,29 @@ export default function StudentAssessmentTestPage() {
   const [timeLeft, setTimeLeft] = useState(7200) // seconds
   const [warnings, setWarnings] = useState(0)
   const [showWarningModal, setShowWarningModal] = useState(false)
+  const [showExitConfirmModal, setShowExitConfirmModal] = useState(false)
+  const [autoTerminated, setAutoTerminated] = useState(false)
+  const [terminationReason, setTerminationReason] = useState('')
+  const [checkingReassessment, setCheckingReassessment] = useState(false)
 
   // Active question index and questions list
   const [activeQuestion, setActiveQuestion] = useState(0)
   const [questions, setQuestions] = useState([])
+
+  // Refs to prevent stale closure during browser focus/blur events
+  const codeRef = useRef(code)
+  const userCodesRef = useRef(userCodes)
+  const activeQuestionRef = useRef(activeQuestion)
+  const languageRef = useRef(language)
+  const submittingTestRef = useRef(false)
+  const autoSubmittedRef = useRef(false)
+
+  useEffect(() => { codeRef.current = code }, [code])
+  useEffect(() => { userCodesRef.current = userCodes }, [userCodes])
+  useEffect(() => { activeQuestionRef.current = activeQuestion }, [activeQuestion])
+  useEffect(() => { languageRef.current = language }, [language])
+
+  const maxAllowedFlags = assessment?.maxFlags && assessment.maxFlags > 0 ? assessment.maxFlags : 3
 
   const isFacultyOrAdmin =
     user?.role === 'FACULTY' ||
@@ -236,6 +255,122 @@ export default function StudentAssessmentTestPage() {
       .finally(() => setLoading(false))
   }, [id, user?.username])
 
+  // Core submission executor (used for manual final submit, timer expiration, and proctoring auto-submit)
+  const executeSubmission = async (flagCount, isAuto = false, customReason = '') => {
+    if (submittingTestRef.current) return
+    submittingTestRef.current = true
+    setSubmittingTest(true)
+
+    const currentCode = codeRef.current
+    const currentLang = languageRef.current
+    const currentActiveQ = activeQuestionRef.current
+    const updatedCodes = {
+      ...userCodesRef.current,
+      [`${currentActiveQ}_${currentLang}`]: currentCode,
+    }
+
+    try {
+      const itemsToSubmit = questions.length > 0 ? questions : [{ title: 'Practical Assessment Task' }]
+      const payload = itemsToSubmit.map((item, idx) => {
+        const itemCode = updatedCodes[`${idx}_${currentLang}`] || (idx === currentActiveQ ? currentCode : '')
+        return {
+          assessmentId: parseInt(id, 10),
+          studentName: user?.username ? user.username.toUpperCase() : 'Student Coder',
+          studentHandle: user?.username || 'student_user',
+          rollNo: '2023CSB' + ((user?.id || 1) * 104),
+          problemTitle: item?.title || `Problem ${idx + 1}`,
+          language: currentLang,
+          sourceCode: itemCode || '// No code submitted',
+          tabSwitchFlags: flagCount,
+          timeTaken: isAuto
+            ? (customReason || `Terminated (>${maxAllowedFlags} Flags)`)
+            : 'Exam duration elapsed',
+        }
+      })
+
+      const { data } = await api.post(`/college/assessments/${id}/submissions/batch`, payload)
+      setSubmissionResults(Array.isArray(data) ? data : [data])
+      setSubmitted(true)
+      if (isAuto) {
+        setAutoTerminated(true)
+      }
+      localStorage.removeItem(startedStorageKey)
+    } catch (err) {
+      console.error('Failed to submit assessment', err)
+      const errorMsg = err.response?.data?.message || err.message || 'Error recording submission'
+
+      if (err.response?.status === 403) {
+        alert('This assessment has concluded. Submissions are now closed.')
+        navigate('/assessments')
+        return
+      } else if (err.response?.status === 409) {
+        api.get(`/college/assessments/${id}/my-submissions`, { params: { studentHandle: user?.username } })
+          .then((res) => {
+            if (res.data) setSubmissionResults(res.data)
+            setSubmitted(true)
+            if (isAuto) setAutoTerminated(true)
+          })
+        return
+      }
+
+      // Fallback single submit in case of network issue
+      try {
+        const { data } = await api.post(`/college/assessments/${id}/submissions`, {
+          assessmentId: parseInt(id, 10),
+          studentName: user?.username ? user.username.toUpperCase() : 'Student Coder',
+          studentHandle: user?.username || 'student_user',
+          rollNo: '2023CSB' + ((user?.id || 1) * 104),
+          problemTitle: questions[currentActiveQ]?.title || 'Practical Assessment Task',
+          language: currentLang,
+          sourceCode: currentCode,
+          tabSwitchFlags: flagCount,
+          timeTaken: isAuto
+            ? (customReason || `Terminated (>${maxAllowedFlags} Flags)`)
+            : 'Exam duration elapsed',
+        })
+        setSubmissionResults(data ? [data] : [])
+        setSubmitted(true)
+        if (isAuto) setAutoTerminated(true)
+      } catch (e) {
+        if (!isAuto) {
+          alert(`Submission could not be completed: ${errorMsg}`)
+        }
+      }
+    } finally {
+      setSubmittingTest(false)
+      submittingTestRef.current = false
+    }
+  }
+
+  // Teacher Reassessment Checker (polling / on-demand verification)
+  const handleCheckReassessment = async () => {
+    setCheckingReassessment(true)
+    try {
+      const { data } = await api.get(`/college/assessments/${id}/my-submissions`, {
+        params: { studentHandle: user?.username }
+      })
+      if (!data || data.length === 0) {
+        alert('🎉 Your teacher has granted you a reassessment! Resetting your exam session now...')
+        localStorage.removeItem(startedStorageKey)
+        localStorage.removeItem(draftStorageKey)
+        autoSubmittedRef.current = false
+        setSubmitted(false)
+        setTestStarted(false)
+        setWarnings(0)
+        setTerminationReason('')
+        setAutoTerminated(false)
+        setSubmissionResults([])
+      } else {
+        alert('Your previous submission is still on record. Please ask your course teacher/faculty to click "Allow Reassessment" in their dashboard.')
+      }
+    } catch (err) {
+      console.error('Error checking reassessment status', err)
+      alert('Unable to check reassessment status right now. Please try again.')
+    } finally {
+      setCheckingReassessment(false)
+    }
+  }
+
   // Countdown Timer (Only active once student has begun test and not submitted)
   useEffect(() => {
     if (!testStarted || submitted) return
@@ -244,35 +379,48 @@ export default function StudentAssessmentTestPage() {
       setTimeLeft((prev) => {
         if (prev <= 1) {
           clearInterval(timer)
-          handleFinalSubmit()
+          executeSubmission(warnings, false)
           return 0
         }
         return prev - 1
       })
     }, 1000)
     return () => clearInterval(timer)
-  }, [testStarted, submitted])
+  }, [testStarted, submitted, warnings])
 
-  // Anti-Cheating & Browser Restrictions (Tab Switch Detection)
+  // Anti-Cheating & Browser Restrictions (Tab Switch Detection: >maxAllowedFlags triggers instant submit)
   useEffect(() => {
     if (!testStarted || !assessment?.browserRestrictions || submitted) return
 
-    const handleVisibilityChange = () => {
-      if (document.hidden) {
-        setWarnings((prev) => {
-          const next = prev + 1
+    const handleViolation = () => {
+      if (autoSubmittedRef.current || submittingTestRef.current) return
+
+      setWarnings((prev) => {
+        const next = prev + 1
+        if (next > maxAllowedFlags) {
+          // EXCEEDED FACULTY CONFIGURED FLAG LIMIT: Instantly auto-submit
+          autoSubmittedRef.current = true
+          setShowWarningModal(false)
+          const reason = `Terminated: Exceeded proctoring limit of ${maxAllowedFlags} flags (${next} violations recorded)`
+          setTerminationReason(`You exceeded the institutional proctoring limit of ${maxAllowedFlags} flags (${next} violations recorded). Under exam integrity rules, your test has been finalized and submitted automatically.`)
+          setAutoTerminated(true)
+          executeSubmission(next, true, reason)
+          return next
+        } else {
           setShowWarningModal(true)
           return next
-        })
+        }
+      })
+    }
+
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        handleViolation()
       }
     }
 
     const handleBlur = () => {
-      setWarnings((prev) => {
-        const next = prev + 1
-        setShowWarningModal(true)
-        return next
-      })
+      handleViolation()
     }
 
     document.addEventListener('visibilitychange', handleVisibilityChange)
@@ -282,7 +430,70 @@ export default function StudentAssessmentTestPage() {
       document.removeEventListener('visibilitychange', handleVisibilityChange)
       window.removeEventListener('blur', handleBlur)
     }
-  }, [testStarted, assessment, submitted])
+  }, [testStarted, assessment?.browserRestrictions, maxAllowedFlags, submitted])
+
+  // Back Navigation & Page Exit Auto-Submission Interceptor
+  useEffect(() => {
+    if (!testStarted || submitted) return
+
+    // Push state so that the browser Back button fires 'popstate' without immediately navigating away
+    window.history.pushState({ inAssessment: true }, '', window.location.href)
+
+    const handlePopState = () => {
+      if (!autoSubmittedRef.current && !submittingTestRef.current) {
+        autoSubmittedRef.current = true
+        // Keep on the assessment page so student receives their evaluation scorecard and notice
+        window.history.pushState(null, '', window.location.href)
+        const reason = 'Terminated: Navigated back / exited active assessment session'
+        setTerminationReason('You clicked the browser Back button or attempted to exit the active test session. Under university proctoring integrity rules, leaving an active exam triggers instant final submission.')
+        setAutoTerminated(true)
+        executeSubmission(warnings, true, reason)
+      }
+    }
+
+    const handleBeforeUnload = (e) => {
+      if (!autoSubmittedRef.current && !submittingTestRef.current) {
+        try {
+          const currentCode = codeRef.current
+          const currentLang = languageRef.current
+          const currentActiveQ = activeQuestionRef.current
+          const updatedCodes = {
+            ...userCodesRef.current,
+            [`${currentActiveQ}_${currentLang}`]: currentCode,
+          }
+          const itemsToSubmit = questions.length > 0 ? questions : [{ title: 'Practical Assessment Task' }]
+          const payload = itemsToSubmit.map((item, idx) => {
+            const itemCode = updatedCodes[`${idx}_${currentLang}`] || (idx === currentActiveQ ? currentCode : '')
+            return {
+              assessmentId: parseInt(id, 10),
+              studentName: user?.username ? user.username.toUpperCase() : 'Student Coder',
+              studentHandle: user?.username || 'student_user',
+              rollNo: '2023CSB' + ((user?.id || 1) * 104),
+              problemTitle: item?.title || `Problem ${idx + 1}`,
+              language: currentLang,
+              sourceCode: itemCode || '// No code submitted',
+              tabSwitchFlags: warnings,
+              timeTaken: 'Terminated: Exited or refreshed browser tab during active assessment',
+            }
+          })
+          const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' })
+          navigator.sendBeacon(`/api/college/assessments/${id}/submissions/batch`, blob)
+        } catch (err) {}
+
+        e.preventDefault()
+        e.returnValue = 'Assessment session in progress. Leaving will automatically submit your exam.'
+        return e.returnValue
+      }
+    }
+
+    window.addEventListener('popstate', handlePopState)
+    window.addEventListener('beforeunload', handleBeforeUnload)
+
+    return () => {
+      window.removeEventListener('popstate', handlePopState)
+      window.removeEventListener('beforeunload', handleBeforeUnload)
+    }
+  }, [testStarted, submitted, warnings, id, user?.username, user?.id, questions, maxAllowedFlags])
 
   // Format Timer
   const formatTime = (seconds) => {
@@ -364,13 +575,27 @@ export default function StudentAssessmentTestPage() {
     } catch (e) {}
   }
 
+  // Helper to normalize stdout and expected output for fair whitespace comparison
+  const normalizeOutput = (str) =>
+    (str || '')
+      .replace(/\r\n/g, '\n')
+      .split('\n')
+      .map((line) => line.trimEnd())
+      .join('\n')
+      .trim()
+
   // Run Code against Custom or Sample Input
   const handleRunCode = async (overrideInput) => {
     const runInput = overrideInput !== undefined ? overrideInput : customInput
     setRunningCode(true)
     setConsoleTab('output')
     if (isConsoleCollapsed) setIsConsoleCollapsed(false)
-    setConsoleOutput('Compiling & running against test cases...')
+    setConsoleOutput('Compiling & executing code...')
+
+    const currentQ = questions[activeQuestion] || {}
+    const sampleIn = (currentQ.input || '').trim()
+    const sampleOut = (currentQ.output || '').trim()
+    const isSampleTest = sampleOut !== '' && runInput.trim() === sampleIn
 
     try {
       const { data } = await api.post('/compiler/run', {
@@ -379,25 +604,69 @@ export default function StudentAssessmentTestPage() {
         input: runInput,
       })
 
-      const out = data.stdout ?? data.output ?? ''
-      const err = data.stderr ?? data.error ?? ''
-      const isOk = data.status === 'SUCCESS' || data.status === 'ACCEPTED'
+      const rawStdout = data.stdout ?? data.output ?? ''
+      const rawStderr = data.stderr ?? data.error ?? ''
+      const normalizedUserOut = normalizeOutput(rawStdout)
+      const normalizedExpectedOut = normalizeOutput(sampleOut)
 
-      setLastRunStatus({
-        status: data.status,
-        timeMs: data.executionTimeMs || 15,
-        isOk,
-      })
+      const isExecutionSuccess = data.status === 'SUCCESS' || data.status === 'ACCEPTED'
 
-      if (isOk) {
-        setConsoleOutput(out || '(Program executed successfully with 0 errors)')
-        setQuestionRunStatus((prev) => ({ ...prev, [activeQuestion]: 'ACCEPTED' }))
-      } else {
-        setConsoleOutput(err || out || 'Execution error')
+      if (!isExecutionSuccess) {
+        setLastRunStatus({
+          status: data.status || 'ERROR',
+          timeMs: data.executionTimeMs || 0,
+          isOk: false,
+          verdictType: 'ERR',
+        })
+        setConsoleOutput(rawStderr || rawStdout || 'Execution failed.')
         setQuestionRunStatus((prev) => ({ ...prev, [activeQuestion]: 'ERROR' }))
+        return
+      }
+
+      // Check against expected sample output if evaluating against sample testcase
+      if (isSampleTest) {
+        const isMatch = normalizedUserOut === normalizedExpectedOut
+        if (isMatch) {
+          setLastRunStatus({
+            status: 'ACCEPTED',
+            timeMs: data.executionTimeMs || 15,
+            isOk: true,
+            verdictType: 'AC',
+          })
+          setConsoleOutput(
+            `✓ Sample Test Passed (AC)\n\n` +
+            `Input:\n${runInput}\n\n` +
+            `Your Output:\n${rawStdout.trim()}\n\n` +
+            `Expected Output:\n${sampleOut}`
+          )
+          setQuestionRunStatus((prev) => ({ ...prev, [activeQuestion]: 'ACCEPTED' }))
+        } else {
+          setLastRunStatus({
+            status: 'WRONG_ANSWER',
+            timeMs: data.executionTimeMs || 15,
+            isOk: false,
+            verdictType: 'WA',
+          })
+          setConsoleOutput(
+            `✗ Wrong Answer (WA)\n\n` +
+            `Input:\n${runInput}\n\n` +
+            `Your Output:\n${normalizedUserOut ? rawStdout.trim() : '[No output produced - check your print/println statements]'}\n\n` +
+            `Expected Output:\n${sampleOut}`
+          )
+          setQuestionRunStatus((prev) => ({ ...prev, [activeQuestion]: 'ERROR' }))
+        }
+      } else {
+        // Custom input run where no expected output is defined
+        setLastRunStatus({
+          status: 'SUCCESS',
+          timeMs: data.executionTimeMs || 15,
+          isOk: true,
+          verdictType: 'RAN',
+        })
+        setConsoleOutput(rawStdout.trim() || '(Program executed successfully with 0 output)')
       }
     } catch (err) {
-      setLastRunStatus({ status: 'ERROR', timeMs: 0, isOk: false })
+      setLastRunStatus({ status: 'ERROR', timeMs: 0, isOk: false, verdictType: 'ERR' })
       setConsoleOutput(
         `Execution Failed: ${err.response?.data?.error || err.message || 'Server error'}`
       )
@@ -419,75 +688,7 @@ export default function StudentAssessmentTestPage() {
     if (!confirm('Are you sure you want to finalize and submit your assessment? This will record your answers and end the test.')) {
       return
     }
-
-    setSubmittingTest(true)
-    const updatedCodes = {
-      ...userCodes,
-      [`${activeQuestion}_${language}`]: code,
-    }
-
-    try {
-      const itemsToSubmit = questions.length > 0 ? questions : [{ title: 'Practical Assessment Task' }]
-      const payload = itemsToSubmit.map((item, idx) => {
-        const itemCode = updatedCodes[`${idx}_${language}`] || (idx === activeQuestion ? code : '')
-        return {
-          assessmentId: parseInt(id, 10),
-          studentName: user?.username ? user.username.toUpperCase() : 'Student Coder',
-          studentHandle: user?.username || 'student_user',
-          rollNo: '2023CSB' + ((user?.id || 1) * 104),
-          problemTitle: item?.title || `Problem ${idx + 1}`,
-          language,
-          sourceCode: itemCode || '// No code submitted',
-          tabSwitchFlags: warnings,
-          timeTaken: 'Exam duration elapsed',
-        }
-      })
-
-      const { data } = await api.post(`/college/assessments/${id}/submissions/batch`, payload)
-      setSubmissionResults(Array.isArray(data) ? data : [data])
-      setSubmitted(true)
-      localStorage.removeItem(startedStorageKey)
-    } catch (err) {
-      console.error('Failed to record submission', err)
-      const errorMsg = err.response?.data?.message || err.message || 'Error recording submission'
-
-      // Check if server rejected due to concluded assessment or duplicate submission
-      if (err.response?.status === 403) {
-        alert('This assessment has concluded. Submissions are now closed.')
-        navigate('/assessments')
-        return
-      } else if (err.response?.status === 409) {
-        alert('You have already submitted answers for this assessment. Redirecting to your scorecard.')
-        // Reload submissions
-        api.get(`/college/assessments/${id}/my-submissions`, { params: { studentHandle: user?.username } })
-          .then((res) => {
-            if (res.data) setSubmissionResults(res.data)
-            setSubmitted(true)
-          })
-        return
-      }
-
-      // Fallback single submit in case of network issue
-      try {
-        const { data } = await api.post(`/college/assessments/${id}/submissions`, {
-          assessmentId: parseInt(id, 10),
-          studentName: user?.username ? user.username.toUpperCase() : 'Student Coder',
-          studentHandle: user?.username || 'student_user',
-          rollNo: '2023CSB' + ((user?.id || 1) * 104),
-          problemTitle: questions[activeQuestion]?.title || 'Practical Assessment Task',
-          language,
-          sourceCode: code,
-          tabSwitchFlags: warnings,
-          timeTaken: 'Exam duration elapsed',
-        })
-        setSubmissionResults(data ? [data] : [])
-        setSubmitted(true)
-      } catch (e) {
-        alert(`Submission could not be completed: ${errorMsg}`)
-      }
-    } finally {
-      setSubmittingTest(false)
-    }
+    await executeSubmission(warnings, false)
   }
 
   // Helper to check institutional authorization
@@ -653,8 +854,8 @@ export default function StudentAssessmentTestPage() {
                 <span className="text-base font-black text-slate-900 truncate block">{assessment?.allowedLanguages || 'Java, C++, Python, C'}</span>
               </div>
               <div className="bg-slate-50 border border-slate-100 rounded-xl p-3.5">
-                <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider block">Max Attempts</span>
-                <span className="text-base font-black text-emerald-700 font-mono">1 Single Attempt</span>
+                <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider block">Proctoring Limit</span>
+                <span className="text-base font-black text-amber-600 font-mono">{maxAllowedFlags} Flags Allowed</span>
               </div>
             </div>
           </div>
@@ -694,8 +895,16 @@ export default function StudentAssessmentTestPage() {
               <div className="flex items-start gap-3 p-3 rounded-xl bg-slate-50 border border-slate-100">
                 <span className="text-base mt-0.5">🛡️</span>
                 <div>
-                  <strong className="text-slate-900 block font-bold">Proctoring & Focus Integrity:</strong>
-                  <span>Switching tabs, navigating to other windows, or opening unauthorized tools will be recorded as proctoring violations and submitted to your course faculty.</span>
+                  <strong className="text-slate-900 block font-bold">Proctoring Flag Limit ({maxAllowedFlags} Allowed):</strong>
+                  <span>Switching tabs or losing window focus more than <strong>{maxAllowedFlags} times</strong> will automatically terminate and finalize your assessment.</span>
+                </div>
+              </div>
+
+              <div className="flex items-start gap-3 p-3 rounded-xl bg-slate-50 border border-slate-100">
+                <span className="text-base mt-0.5">↩️</span>
+                <div>
+                  <strong className="text-slate-900 block font-bold">Exit & Back Navigation Auto-Submit:</strong>
+                  <span>Once you enter the assessment, clicking the browser Back button, navigating away, or closing the tab will <strong>instantly auto-submit</strong> your current code.</span>
                 </div>
               </div>
 
@@ -703,7 +912,7 @@ export default function StudentAssessmentTestPage() {
                 <span className="text-base mt-0.5">🔒</span>
                 <div>
                   <strong className="text-slate-900 block font-bold">Single Final Submission:</strong>
-                  <span>Once you finalize and submit your test, solutions are permanently locked and evaluated. Duplicate re-attempts are strictly barred.</span>
+                  <span>Once you finalize and submit your test, solutions are permanently locked and evaluated. Duplicate re-attempts are strictly barred unless your teacher grants a reassessment.</span>
                 </div>
               </div>
             </div>
@@ -809,6 +1018,36 @@ export default function StudentAssessmentTestPage() {
                 Institution: <strong className="text-slate-700">{assessment?.collegeName}</strong> • Candidate: <strong className="text-slate-700">@{user?.username}</strong>
               </p>
             </div>
+
+            {/* Auto-Termination / Locked Out Proctoring Banner */}
+            {(autoTerminated || submissionResults.some(s => (s.tabSwitchFlags || 0) > maxAllowedFlags || (s.timeTaken && s.timeTaken.includes('Terminated')))) && (
+              <div className="bg-red-50 border-2 border-red-300 rounded-2xl p-5 text-left space-y-3 mt-4">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xl">🛑</span>
+                    <h3 className="text-sm font-bold text-red-800">
+                      Assessment Auto-Submitted: {submissionResults[0]?.timeTaken || 'Proctoring Violation / Session Exit'}
+                    </h3>
+                  </div>
+                  <span className="bg-red-100 text-red-800 font-mono text-[10px] font-black px-2 py-0.5 rounded border border-red-200">
+                    LOCKED OUT
+                  </span>
+                </div>
+                <p className="text-xs text-red-700 leading-relaxed">
+                  Your assessment was automatically finalized &amp; submitted ({submissionResults[0]?.timeTaken || `${warnings} violations detected, exceeding limit of ${maxAllowedFlags} flags`}). You cannot resubmit code on your own. If your instructor agrees, they can click <strong>"Allow Reassessment"</strong> in their dashboard to grant you a retake.
+                </p>
+                <div className="pt-1 flex items-center gap-3">
+                  <button
+                    onClick={handleCheckReassessment}
+                    disabled={checkingReassessment}
+                    className="bg-red-600 hover:bg-red-700 text-white font-bold text-xs px-4 py-2 rounded-xl transition shadow-xs flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                  >
+                    <span>🔄</span>
+                    <span>{checkingReassessment ? 'Checking with Server...' : 'Check If Teacher Allowed Reassessment'}</span>
+                  </button>
+                </div>
+              </div>
+            )}
 
             {/* Score Metrics Grid */}
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 pt-4 border-t border-slate-100 text-left">
@@ -986,6 +1225,14 @@ export default function StudentAssessmentTestPage() {
           <span className="bg-[#5b4638] text-white px-2 py-0.5 rounded font-black text-xs">
             BYTEFORGE
           </span>
+          <button
+            onClick={() => setShowExitConfirmModal(true)}
+            className="text-xs text-gray-400 hover:text-white px-2.5 py-1 rounded-lg border border-gray-700 bg-gray-800 hover:bg-gray-700 transition flex items-center gap-1.5 shrink-0 cursor-pointer"
+            title="Exit Test & Auto-Submit"
+          >
+            <span>←</span>
+            <span className="hidden sm:inline">Back / Exit</span>
+          </button>
           <div>
             <h1 className="text-xs sm:text-sm font-bold text-white flex items-center gap-2">
               <span className="truncate max-w-[200px] sm:max-w-xs">{assessment?.assessmentName}</span>
@@ -1027,25 +1274,150 @@ export default function StudentAssessmentTestPage() {
         </div>
       </header>
 
-      {/* Warning Alert Modal for Tab Switch */}
-      {showWarningModal && (
-        <div className="fixed inset-0 bg-black/80 backdrop-blur-xs flex items-center justify-center p-4 z-50 animate-fade-in">
+      {/* Exit & Auto-Submit Confirmation Modal */}
+      {showExitConfirmModal && !autoTerminated && (
+        <div className="fixed inset-0 bg-black/85 backdrop-blur-xs flex items-center justify-center p-4 z-50 animate-fade-in">
           <div className="bg-[#1e293b] border-2 border-red-500/80 rounded-2xl p-6 max-w-md w-full text-center space-y-4 shadow-2xl">
-            <div className="text-3xl">⚠️</div>
-            <h3 className="text-lg font-bold text-red-400">
-              Proctoring Warning: Tab Switch Detected!
-            </h3>
-            <p className="text-xs text-gray-300 leading-relaxed">
-              You left the exam window. This event has been flagged and recorded into the faculty integrity report.
-            </p>
-            <div className="bg-red-950/50 border border-red-800 rounded-lg p-2.5 text-xs font-mono text-red-300">
-              Total Violations: {warnings}
+            <div className="text-4xl animate-pulse">🚪</div>
+            <div className="space-y-1">
+              <span className="text-[10px] font-black uppercase tracking-widest text-red-300 bg-red-950/80 border border-red-800 px-3 py-1 rounded-full">
+                Exit Active Examination
+              </span>
+              <h3 className="text-lg font-bold text-white pt-1">
+                Leave &amp; Automatically Submit Test?
+              </h3>
             </div>
+
+            <p className="text-xs text-gray-300 leading-relaxed">
+              You are currently inside an active, timed exam. If you go back or exit now, your current code solutions will be <strong>immediately finalized and submitted</strong> to your faculty. You will not be able to re-enter without instructor authorization.
+            </p>
+
+            <div className="bg-red-950/40 border border-red-800/80 rounded-xl p-3 text-xs text-left space-y-1 text-red-200">
+              <p className="font-bold flex items-center gap-1.5 text-white">
+                <span>⚠️</span>
+                <span>Proctoring Exit Rule</span>
+              </p>
+              <p className="text-[11px] text-gray-400">
+                Leaving the session marks your submission as <span className="font-mono text-amber-300">"Terminated: Student exited assessment session"</span>.
+              </p>
+            </div>
+
+            <div className="flex items-center gap-3 pt-2">
+              <button
+                onClick={() => setShowExitConfirmModal(false)}
+                className="flex-1 bg-gray-800 hover:bg-gray-700 text-gray-200 font-bold text-xs py-2.5 rounded-xl border border-gray-700 transition cursor-pointer"
+              >
+                Cancel, Stay in Exam
+              </button>
+              <button
+                onClick={() => {
+                  setShowExitConfirmModal(false)
+                  autoSubmittedRef.current = true
+                  const reason = 'Terminated: Student exited assessment session'
+                  setTerminationReason('You exited the active test session. Under university proctoring integrity rules, leaving an active exam triggers instant final submission.')
+                  setAutoTerminated(true)
+                  executeSubmission(warnings, true, reason)
+                }}
+                className="flex-1 bg-red-600 hover:bg-red-500 text-white font-bold text-xs py-2.5 rounded-xl transition shadow-lg cursor-pointer"
+              >
+                Yes, Exit &amp; Submit
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Warning Alert Modal for Tab Switch */}
+      {showWarningModal && !autoTerminated && (
+        <div className="fixed inset-0 bg-black/80 backdrop-blur-xs flex items-center justify-center p-4 z-50 animate-fade-in">
+          <div className="bg-[#1e293b] border-2 border-amber-500/80 rounded-2xl p-6 max-w-md w-full text-center space-y-4 shadow-2xl">
+            <div className="text-3xl animate-bounce">⚠️</div>
+            <div className="space-y-1">
+              <span className={`text-[10px] font-black uppercase tracking-widest px-2.5 py-0.5 rounded-full border ${
+                warnings >= maxAllowedFlags ? 'bg-red-950 text-red-400 border-red-700' : 'bg-amber-950 text-amber-400 border-amber-700'
+              }`}>
+                Flag {warnings} of {maxAllowedFlags} Allowed
+              </span>
+              <h3 className="text-lg font-bold text-white pt-1">
+                {warnings >= maxAllowedFlags
+                  ? 'Final Warning: Critical Threshold Reached!'
+                  : warnings === 1
+                  ? 'Proctoring Warning: Focus Lost / Tab Switched'
+                  : 'Urgent Warning: Proctoring Violation'}
+              </h3>
+            </div>
+
+            <p className="text-xs text-gray-300 leading-relaxed">
+              {warnings >= maxAllowedFlags ? (
+                <>
+                  <strong className="text-red-400 block font-bold mb-1">STRICT PENALTY ALERT:</strong>
+                  You have reached the limit of <strong>{maxAllowedFlags} allowed warnings</strong>. The very next tab switch or loss of window focus will instantly finalize &amp; submit your code.
+                </>
+              ) : (
+                <>
+                  You left or minimized the assessment window. This event has been logged for faculty review. You have <strong className="text-amber-400">{Math.max(0, maxAllowedFlags - warnings)} warning(s) remaining</strong> before automatic submission.
+                </>
+              )}
+            </p>
+
+            <div className="bg-amber-950/40 border border-amber-800/80 rounded-lg p-2.5 text-xs font-mono text-amber-300 flex items-center justify-between">
+              <span>Proctoring Violations:</span>
+              <span className="font-bold text-red-400">{warnings} / {maxAllowedFlags} Flags</span>
+            </div>
+
             <button
               onClick={() => setShowWarningModal(false)}
-              className="w-full bg-red-600 hover:bg-red-500 text-white font-bold text-xs py-2.5 rounded-lg transition-colors"
+              className={`w-full font-bold text-xs py-2.5 rounded-lg transition-colors cursor-pointer ${
+                warnings >= maxAllowedFlags
+                  ? 'bg-red-600 hover:bg-red-500 text-white shadow-lg'
+                  : 'bg-amber-600 hover:bg-amber-500 text-white'
+              }`}
             >
-              I Understand, Resume Exam
+              I Understand, Return to Test
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Auto-Termination Lockout Modal */}
+      {autoTerminated && (
+        <div className="fixed inset-0 bg-black/90 backdrop-blur-md flex items-center justify-center p-4 z-50 animate-fade-in">
+          <div className="bg-[#1a0f0f] border-2 border-red-600 rounded-3xl p-7 max-w-md w-full text-center space-y-5 shadow-2xl">
+            <div className="text-5xl animate-pulse">🚨</div>
+            <div className="space-y-1">
+              <span className="text-[10px] font-black uppercase tracking-widest text-red-300 bg-red-950 border border-red-800 px-3 py-1 rounded-full">
+                Test Terminated
+              </span>
+              <h3 className="text-xl font-black text-white tracking-tight pt-1">
+                Assessment Automatically Submitted
+              </h3>
+            </div>
+
+            <p className="text-xs text-gray-300 leading-relaxed">
+              {terminationReason || `You exceeded the maximum institutional limit of ${maxAllowedFlags} proctoring flags (${warnings} violations recorded).`}
+            </p>
+
+            <div className="bg-red-950/60 border border-red-800/80 rounded-2xl p-4 text-xs text-left space-y-2 text-red-200">
+              <p className="font-bold flex items-center gap-1.5 text-white">
+                <span>🔒</span>
+                <span>Session Locked &amp; Evaluated</span>
+              </p>
+              <p className="text-[11px] text-gray-400 leading-relaxed">
+                Your current code has been finalized and submitted automatically to your course instructor. You cannot re-enter the test on your own.
+              </p>
+              <p className="text-[11px] text-amber-300/90 leading-relaxed pt-1 border-t border-red-900/60">
+                💡 <strong>Need to Retake?</strong> Contact your course faculty. They have the administrative ability to grant you a reassessment from their dashboard.
+              </p>
+            </div>
+
+            <button
+              onClick={() => {
+                setAutoTerminated(false)
+                setSubmitted(true)
+              }}
+              className="w-full bg-red-600 hover:bg-red-500 text-white font-black text-xs py-3 rounded-xl transition shadow-lg cursor-pointer"
+            >
+              View Evaluation Scorecard
             </button>
           </div>
         </div>
@@ -1273,12 +1645,16 @@ export default function StudentAssessmentTestPage() {
                   {lastRunStatus && (
                     <span
                       className={`text-[10px] px-1.5 py-0.2 rounded font-mono font-black ${
-                        lastRunStatus.isOk
+                        lastRunStatus.verdictType === 'AC'
                           ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                          : lastRunStatus.verdictType === 'WA'
+                          ? 'bg-red-500/20 text-red-300 border border-red-500/40'
+                          : lastRunStatus.verdictType === 'RAN'
+                          ? 'bg-blue-500/20 text-blue-300 border border-blue-500/40'
                           : 'bg-red-500/20 text-red-300 border border-red-500/40'
                       }`}
                     >
-                      {lastRunStatus.isOk ? 'AC' : lastRunStatus.status || 'ERR'}
+                      {lastRunStatus.verdictType || (lastRunStatus.isOk ? 'AC' : 'ERR')}
                     </span>
                   )}
                 </button>
@@ -1385,13 +1761,21 @@ export default function StudentAssessmentTestPage() {
                         {lastRunStatus && (
                           <span
                             className={`text-[11px] px-2 py-0.5 rounded font-black font-mono ${
-                              lastRunStatus.isOk
+                              lastRunStatus.verdictType === 'AC'
                                 ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/40'
+                                : lastRunStatus.verdictType === 'WA'
+                                ? 'bg-red-500/20 text-red-400 border border-red-500/40'
+                                : lastRunStatus.verdictType === 'RAN'
+                                ? 'bg-blue-500/20 text-blue-400 border border-blue-500/40'
                                 : 'bg-red-500/20 text-red-400 border border-red-500/40'
                             }`}
                           >
-                            {lastRunStatus.isOk
+                            {lastRunStatus.verdictType === 'AC'
                               ? `ACCEPTED (${lastRunStatus.timeMs}ms)`
+                              : lastRunStatus.verdictType === 'WA'
+                              ? `WRONG ANSWER (${lastRunStatus.timeMs}ms)`
+                              : lastRunStatus.verdictType === 'RAN'
+                              ? `RAN (${lastRunStatus.timeMs}ms)`
                               : lastRunStatus.status || 'ERROR'}
                           </span>
                         )}

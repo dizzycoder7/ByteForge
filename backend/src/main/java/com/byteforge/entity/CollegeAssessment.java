@@ -45,6 +45,10 @@ public class CollegeAssessment {
     private boolean enableReview;
     private boolean hideStudentReport;
 
+    @Column(nullable = false)
+    @Builder.Default
+    private int maxFlags = 3;
+
     @Column(length = 200)
     private String allowedLanguages; // e.g. "C,C++,Java,Pyth 3"
 

@@ -305,10 +305,13 @@ public class JudgeService {
 
             RunResult result = runTestCase(tempDir, language, sourceFilename, input != null ? input : "", 5000);
 
+            // For custom execution without test case verification, exitCode 0 is SUCCESS (not AC)
+            String status = result.verdict() == Verdict.ACCEPTED ? "SUCCESS" : result.verdict().name();
+
             return new CompilerResponse(
                     result.stdout(),
                     result.stderr(),
-                    result.verdict().name(),
+                    status,
                     result.executionTimeMs()
             );
 

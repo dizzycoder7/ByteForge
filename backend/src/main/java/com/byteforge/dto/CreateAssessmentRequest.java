@@ -23,6 +23,7 @@ public record CreateAssessmentRequest(
     boolean browserRestrictions,
     boolean enableReview,
     boolean hideStudentReport,
+    Integer maxFlags,
 
     String allowedLanguages,
     String collegeName

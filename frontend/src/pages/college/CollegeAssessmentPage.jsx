@@ -109,13 +109,27 @@ export default function CollegeAssessmentPage() {
   // Form State matching CodeChef screenshots
   const [cohort, setCohort] = useState('Faculty Review - Learn C')
   const [assessmentName, setAssessmentName] = useState('')
-  const [startTime, setStartTime] = useState('2026-09-05 10:00:00')
+  const [startDate, setStartDate] = useState(() => {
+    const today = new Date()
+    return today.toISOString().split('T')[0]
+  })
+  const [startTimeOfDay, setStartTimeOfDay] = useState('10:00')
+
+  const getFormattedStartTime = () => {
+    const datePart = startDate || new Date().toISOString().split('T')[0]
+    const timePart = startTimeOfDay
+      ? (startTimeOfDay.length === 5 ? `${startTimeOfDay}:00` : startTimeOfDay)
+      : '10:00:00'
+    return `${datePart} ${timePart}`
+  }
+
   const [durationDays, setDurationDays] = useState(0)
   const [durationHours, setDurationHours] = useState(1)
   const [durationMins, setDurationMins] = useState(30)
   const [syllabus, setSyllabus] = useState('Loops::Functions::Arrays')
   const [description, setDescription] = useState('')
   const [browserRestrictions, setBrowserRestrictions] = useState(true)
+  const [maxFlags, setMaxFlags] = useState(3)
   const [enableReview, setEnableReview] = useState(false)
   const [hideStudentReport, setHideStudentReport] = useState(false)
 
@@ -282,82 +296,50 @@ export default function CollegeAssessmentPage() {
         setStudentSubmissions(data)
         setSelectedSubmission(data[0])
       } else {
-        // Sample demo submissions so the code viewer is immediately interactive
-        const fallbackSubs = [
-          {
-            id: 101,
-            assessmentId: assessment.id,
-            studentName: 'Priya Sharma',
-            studentHandle: 'priya_sharma',
-            rollNo: '2023CSB1042',
-            problemTitle: 'Problem 1: Invert a Binary Tree',
-            language: 'JAVA',
-            score: 100,
-            verdict: 'ACCEPTED (10/10 Passed)',
-            tabSwitchFlags: 0,
-            timeTaken: '38 mins',
-            sourceCode: `import java.util.*;
-
-class TreeNode {
-    int val;
-    TreeNode left, right;
-    TreeNode(int x) { val = x; }
-}
-
-public class Solution {
-    public TreeNode invertTree(TreeNode root) {
-        if (root == null) return null;
-        TreeNode left = invertTree(root.left);
-        TreeNode right = invertTree(root.right);
-        root.left = right;
-        root.right = left;
-        return root;
-    }
-
-    public static void main(String[] args) {
-        System.out.println("Binary Tree Inversion Test Passed (10/10 Testcases)");
-    }
-}`,
-          },
-          {
-            id: 102,
-            assessmentId: assessment.id,
-            studentName: 'Rohit Coder',
-            studentHandle: 'rohit_coder',
-            rollNo: '2023CSB1018',
-            problemTitle: 'Problem 2: Maximum Subarray Sum (Kadane)',
-            language: 'CPP',
-            score: 90,
-            verdict: 'ACCEPTED (9/10 Passed)',
-            tabSwitchFlags: 1,
-            timeTaken: '44 mins',
-            sourceCode: `#include <iostream>
-#include <vector>
-#include <algorithm>
-using namespace std;
-
-int maxSubArray(vector<int>& nums) {
-    int maxSoFar = nums[0];
-    int currMax = nums[0];
-    for (size_t i = 1; i < nums.size(); ++i) {
-        currMax = max(nums[i], currMax + nums[i]);
-        maxSoFar = max(maxSoFar, currMax);
-    }
-    return maxSoFar;
-}
-
-int main() {
-    vector<int> nums = {-2,1,-3,4,-1,2,1,-5,4};
-    cout << "Maximum Subarray Sum: " << maxSubArray(nums) << endl;
-    return 0;
-}`,
-          },
-        ]
-        setStudentSubmissions(fallbackSubs)
-        setSelectedSubmission(fallbackSubs[0])
+        setStudentSubmissions([])
+        setSelectedSubmission(null)
       }
     } catch (err) {
       console.error('Failed to load submissions', err)
+      setStudentSubmissions([])
+      setSelectedSubmission(null)
+    }
+  }
+
+  // Faculty action: Allow Reassessment for a student
+  const handleAllowReassessment = async (sub) => {
+    if (!sub || !sub.studentHandle) return
+    const targetAssessmentId = inspectAssessment?.id || selectedAssessmentForSubmissions?.id || sub.assessmentId
+
+    const confirmed = window.confirm(
+      `Allow Reassessment for ${sub.studentName} (@${sub.studentHandle})?\n\n` +
+      `• This will clear their prior submission and reset their ${sub.tabSwitchFlags || 0} violation flag(s).\n` +
+      `• The student will be immediately permitted to re-enter and retake this assessment.\n\n` +
+      `Do you want to proceed?`
+    )
+    if (!confirmed) return
+
+    try {
+      const res = await api.delete(`/college/assessments/${targetAssessmentId}/submissions/reset`, {
+        params: { studentHandle: sub.studentHandle }
+      })
+      alert(`✅ Reassessment Granted: ${res.data?.message || 'Previous attempt cleared. Student can now retake.'}`)
+
+      // Refresh submissions in Modal
+      if (inspectAssessment?.id) {
+        const { data } = await api.get(`/college/assessments/${inspectAssessment.id}/submissions`)
+        setStudentSubmissions(data || [])
+        if (selectedSubmission?.studentHandle === sub.studentHandle) {
+          setSelectedSubmission(data && data.length > 0 ? data[0] : null)
+        }
+      }
+      // Refresh submissions in Evaluations tab
+      if (selectedAssessmentForSubmissions?.id) {
+        loadSubmissionsForAssessment(selectedAssessmentForSubmissions.id, selectedAssessmentForSubmissions)
+      }
+    } catch (err) {
+      console.error('Failed to grant reassessment', err)
+      alert(`Failed to grant reassessment: ${err.response?.data?.message || err.message}`)
     }
   }
 
@@ -570,13 +552,14 @@ int main() {
       const { data: newAssessment } = await api.post('/college/assessments', {
         cohort,
         assessmentName,
-        startTime: startTime || '2026-09-05 10:00:00',
+        startTime: getFormattedStartTime(),
         durationDays: dDays,
         durationHours: dHours,
         durationMins: dMins,
         syllabus,
         description,
         browserRestrictions,
+        maxFlags: browserRestrictions ? (parseInt(maxFlags, 10) || 3) : 3,
         enableReview,
         hideStudentReport,
         allowedLanguages: allowed,
@@ -843,24 +826,48 @@ int main() {
                     </p>
                   </div>
 
-                  {/* 3. Start Time */}
+                  {/* 3. Schedule Start Date & Time Pickers */}
                   <div>
                     <label className="block text-xs font-bold text-gray-800 mb-1.5">
-                      Start Time
+                      Schedule Start Date &amp; Time
                     </label>
-                    <div className="relative max-w-xs">
-                      <input
-                        type="text"
-                        value={startTime}
-                        onChange={(e) => setStartTime(e.target.value)}
-                        required
-                        placeholder="YYYY-MM-DD hh:mm:ss"
-                        className="w-full px-3.5 py-2.5 pr-10 text-xs border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-900 font-mono"
-                      />
-                      <span className="absolute inset-y-0 right-0 pr-3 flex items-center text-gray-400 text-sm pointer-events-none">
-                        📅
-                      </span>
+                    <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3 max-w-lg">
+                      {/* Date Picker (Calendar) */}
+                      <div className="flex-1 relative">
+                        <span className="absolute inset-y-0 left-0 pl-3 flex items-center text-gray-500 text-sm pointer-events-none select-none">
+                          📅
+                        </span>
+                        <input
+                          type="date"
+                          value={startDate}
+                          onChange={(e) => setStartDate(e.target.value)}
+                          required
+                          className="w-full pl-9 pr-3 py-2.5 text-xs border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-900 bg-white font-mono cursor-pointer"
+                          title="Click to select exam start date"
+                        />
+                      </div>
+
+                      {/* Time Picker (Clock) */}
+                      <div className="w-full sm:w-44 relative">
+                        <span className="absolute inset-y-0 left-0 pl-3 flex items-center text-gray-500 text-sm pointer-events-none select-none">
+                          ⏰
+                        </span>
+                        <input
+                          type="time"
+                          value={startTimeOfDay}
+                          onChange={(e) => setStartTimeOfDay(e.target.value)}
+                          required
+                          className="w-full pl-9 pr-3 py-2.5 text-xs border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-900 bg-white font-mono cursor-pointer"
+                          title="Click to select exam start time"
+                        />
+                      </div>
                     </div>
+                    <p className="text-[11px] text-gray-500 mt-1.5 flex items-center gap-1.5">
+                      <span>Scheduled Timestamp:</span>
+                      <strong className="text-blue-600 font-mono bg-blue-50 px-2 py-0.5 rounded border border-blue-200">
+                        {getFormattedStartTime()}
+                      </strong>
+                    </p>
                   </div>
 
                   {/* 4. Duration of Assessment (3 Inputs) */}
@@ -960,10 +967,36 @@ int main() {
                           Enable Browsers Restrictions
                         </span>
                         <p className="text-[11px] text-gray-500">
-                          Tick the checkbox if you want to enable browsers restrictions on assessments.
+                          Tick the checkbox if you want to enable browsers restrictions and tab monitoring on assessments.
                         </p>
                       </div>
                     </label>
+
+                    {browserRestrictions && (
+                      <div className="ml-6.5 p-3.5 bg-blue-50/60 border border-blue-200/80 rounded-xl space-y-2 max-w-lg transition-all">
+                        <div className="flex items-center justify-between gap-3">
+                          <label className="text-xs font-bold text-gray-800 flex items-center gap-1.5">
+                            <span>🛡️</span>
+                            <span>Proctoring Flag Limit (Tab-Switch Threshold)</span>
+                          </label>
+                          <select
+                            value={maxFlags}
+                            onChange={(e) => setMaxFlags(parseInt(e.target.value, 10))}
+                            className="bg-white border border-gray-300 text-gray-800 text-xs font-bold rounded-lg px-3 py-1.5 focus:ring-2 focus:ring-blue-500 focus:outline-none shadow-xs"
+                          >
+                            <option value={1}>1 Flag (Strict Zero-Tolerance)</option>
+                            <option value={2}>2 Flags</option>
+                            <option value={3}>3 Flags (Standard Default)</option>
+                            <option value={4}>4 Flags</option>
+                            <option value={5}>5 Flags (Lenient)</option>
+                            <option value={10}>10 Flags</option>
+                          </select>
+                        </div>
+                        <p className="text-[11px] text-gray-600 leading-relaxed">
+                          Controls the maximum number of tab switches or focus-loss violations allowed before candidate's exam is <strong>automatically submitted &amp; locked</strong>.
+                        </p>
+                      </div>
+                    )}
 
                     <label className="flex items-start gap-2.5 cursor-pointer select-none">
                       <input
@@ -1095,7 +1128,12 @@ int main() {
                         {assessments.map((a) => (
                           <tr key={a.id} className="hover:bg-gray-50/70">
                             <td className="px-4 py-3 font-bold text-gray-900">
-                              {a.assessmentName}
+                              <div>{a.assessmentName}</div>
+                              {a.browserRestrictions && (
+                                <span className="inline-flex items-center gap-1 text-[10px] text-amber-700 bg-amber-50 border border-amber-200/80 px-1.5 py-0.5 rounded font-mono mt-0.5 font-medium">
+                                  <span>🛡️</span> Max {a.maxFlags || 3} Flags
+                                </span>
+                              )}
                             </td>
                             <td className="px-4 py-3 text-gray-600">{a.cohort}</td>
                             <td className="px-4 py-3 font-mono text-[11px] text-gray-500">{a.startTime}</td>
@@ -1884,8 +1922,16 @@ int main() {
                                   </td>
 
                                   <td className="px-4 py-3.5 text-center">
-                                    {(sub.tabSwitchFlags || 0) > 0 ? (
-                                      <span className="bg-red-50 text-red-700 border border-red-200 text-[10px] font-bold px-2 py-0.5 rounded-full flex items-center justify-center gap-1">
+                                    {(sub.tabSwitchFlags || 0) > 3 ? (
+                                      <div className="flex flex-col items-center gap-0.5">
+                                        <span className="bg-red-100 text-red-800 border border-red-300 text-[10px] font-black px-2 py-0.5 rounded-full flex items-center justify-center gap-1 shadow-2xs">
+                                          <span>🚨</span>
+                                          <span>{sub.tabSwitchFlags} flags (Auto-Submitted)</span>
+                                        </span>
+                                        <span className="text-[9px] text-red-600 font-bold uppercase tracking-wider">Locked Out</span>
+                                      </div>
+                                    ) : (sub.tabSwitchFlags || 0) > 0 ? (
+                                      <span className="bg-amber-50 text-amber-700 border border-amber-200 text-[10px] font-bold px-2 py-0.5 rounded-full flex items-center justify-center gap-1">
                                         <span>⚠️</span>
                                         <span>{sub.tabSwitchFlags} flags</span>
                                       </span>
@@ -1897,17 +1943,27 @@ int main() {
                                   </td>
 
                                   <td className="px-4 py-3.5 text-center">
-                                    <button
-                                      onClick={() => {
-                                        setInspectingSub(sub)
-                                        setEditScore(sub.score || 0)
-                                        setEditFeedback(sub.facultyFeedback || '')
-                                      }}
-                                      className="bg-[#2f66d4] hover:bg-[#2554b5] text-white font-bold text-xs px-3 py-1.5 rounded-xl shadow-xs transition flex items-center justify-center gap-1.5 mx-auto"
-                                    >
-                                      <span>👁️</span>
-                                      <span>View Code &amp; Grade</span>
-                                    </button>
+                                    <div className="flex flex-col items-center gap-1.5 max-w-[150px] mx-auto">
+                                      <button
+                                        onClick={() => {
+                                          setInspectingSub(sub)
+                                          setEditScore(sub.score || 0)
+                                          setEditFeedback(sub.facultyFeedback || '')
+                                        }}
+                                        className="w-full bg-[#2f66d4] hover:bg-[#2554b5] text-white font-bold text-xs px-3 py-1.5 rounded-xl shadow-xs transition flex items-center justify-center gap-1.5 cursor-pointer"
+                                      >
+                                        <span>👁️</span>
+                                        <span>View Code</span>
+                                      </button>
+                                      <button
+                                        onClick={() => handleAllowReassessment(sub)}
+                                        className="w-full bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-300 hover:border-amber-400 font-bold text-[11px] px-2 py-1 rounded-xl transition flex items-center justify-center gap-1 shadow-2xs cursor-pointer"
+                                        title="Allow this student to retake the assessment"
+                                      >
+                                        <span>🔄</span>
+                                        <span>Allow Reassessment</span>
+                                      </button>
+                                    </div>
                                   </td>
                                 </tr>
                               )
@@ -2097,109 +2153,132 @@ int main() {
 
             {/* Modal Body: 2-Column Inspector */}
             <div className="flex-1 grid grid-cols-1 md:grid-cols-12 overflow-hidden">
-              
-              {/* Left Column: Student Roster List (4 cols) */}
-              <div className="md:col-span-4 border-r border-gray-800 overflow-y-auto p-4 space-y-2 bg-[#0f172a]/70">
-                <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-2">
-                  Select Student to Review Code:
-                </p>
-                {studentSubmissions.map((sub) => (
-                  <div
-                    key={sub.id}
-                    onClick={() => setSelectedSubmission(sub)}
-                    className={`p-3 rounded-xl border transition-all cursor-pointer text-left space-y-1 ${
-                      selectedSubmission?.id === sub.id
-                        ? 'bg-blue-600/20 border-blue-500 text-white shadow-sm'
-                        : 'bg-[#1e293b] border-gray-800 text-gray-300 hover:border-gray-700'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between">
-                      <span className="font-bold text-xs">{sub.studentName}</span>
-                      <span className="text-[10px] font-mono bg-blue-900/60 text-blue-300 px-1.5 py-0.5 rounded">
-                        {sub.score}/100 Pts
-                      </span>
-                    </div>
-                    <div className="text-[11px] text-gray-400 flex items-center justify-between">
-                      <span>Roll: {sub.rollNo}</span>
-                      <span className="font-mono text-emerald-400 font-bold">{sub.language}</span>
-                    </div>
-                    <div className="text-[10px] text-gray-500 flex items-center justify-between">
-                      <span>⏱ {sub.timeTaken}</span>
-                      <span className={sub.tabSwitchFlags > 0 ? 'text-amber-400 font-bold' : 'text-gray-400'}>
-                        {sub.tabSwitchFlags > 0 ? `⚠️ ${sub.tabSwitchFlags} Tab switches` : '✓ 0 Flags'}
-                      </span>
-                    </div>
-                  </div>
-                ))}
-              </div>
-
-              {/* Right Column: Monaco Code Viewer (8 cols) */}
-              <div className="md:col-span-8 flex flex-col bg-[#1e293b] overflow-hidden">
-                {selectedSubmission ? (
-                  <>
-                    {/* Top Status Bar */}
-                    <div className="p-3 bg-[#0f172a] border-b border-gray-800 flex items-center justify-between text-xs">
-                      <div>
-                        <span className="text-gray-400">Exam Question: </span>
-                        <span className="text-white font-bold">{selectedSubmission.problemTitle}</span>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <span className="bg-emerald-950 text-emerald-400 border border-emerald-800 px-2 py-0.5 rounded font-mono font-bold text-[10px]">
-                          {selectedSubmission.verdict}
-                        </span>
-                      </div>
-                    </div>
-
-                    {/* Read-Only Monaco Editor */}
-                    <div className="flex-1 min-h-[300px] h-[360px]">
-                      <Editor
-                        height="100%"
-                        theme="vs-dark"
-                        language={
-                          selectedSubmission.language === 'CPP'
-                            ? 'cpp'
-                            : selectedSubmission.language === 'PYTHON'
-                            ? 'python'
-                            : selectedSubmission.language === 'C'
-                            ? 'c'
-                            : 'java'
-                        }
-                        value={selectedSubmission.sourceCode}
-                        options={{
-                          readOnly: true,
-                          fontSize: 13,
-                          minimap: { enabled: false },
-                          lineNumbers: 'on',
-                          scrollBeyondLastLine: false,
-                          automaticLayout: true,
-                        }}
-                      />
-                    </div>
-
-                    {/* Professor Remarks & Grade Bar */}
-                    <div className="p-3 bg-[#0f172a] border-t border-gray-800 flex items-center justify-between gap-3 text-xs">
-                      <div className="flex-1">
-                        <input
-                          type="text"
-                          placeholder="Add professor feedback (e.g. 'Good optimal recursion, clean code')..."
-                          className="w-full bg-[#1e293b] border border-gray-800 rounded-lg px-3 py-1.5 text-xs text-gray-200 focus:outline-none focus:border-blue-500"
-                        />
-                      </div>
-                      <button
-                        onClick={() => alert(`Feedback saved for ${selectedSubmission.studentName}!`)}
-                        className="bg-blue-600 hover:bg-blue-500 text-white font-bold px-4 py-1.5 rounded-lg text-xs transition-colors"
+              {studentSubmissions.length === 0 ? (
+                <div className="md:col-span-12 p-14 text-center space-y-3 flex flex-col items-center justify-center">
+                  <div className="text-5xl">📭</div>
+                  <h4 className="text-base font-bold text-white">No Student Submissions Recorded Yet</h4>
+                  <p className="text-xs text-gray-400 max-w-md mx-auto leading-relaxed">
+                    No candidates have finalized their exam solutions for <strong className="text-blue-400">{inspectAssessment.assessmentName}</strong> yet. When students take the assessment and submit their code, their complete source files, testcase verdicts, scores, and tab-switch records will be displayed here.
+                  </p>
+                </div>
+              ) : (
+                <>
+                  {/* Left Column: Student Roster List (4 cols) */}
+                  <div className="md:col-span-4 border-r border-gray-800 overflow-y-auto p-4 space-y-2 bg-[#0f172a]/70">
+                    <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-2">
+                      Select Student to Review Code:
+                    </p>
+                    {studentSubmissions.map((sub) => (
+                      <div
+                        key={sub.id}
+                        onClick={() => setSelectedSubmission(sub)}
+                        className={`p-3 rounded-xl border transition-all cursor-pointer text-left space-y-1 ${
+                          selectedSubmission?.id === sub.id
+                            ? 'bg-blue-600/20 border-blue-500 text-white shadow-sm'
+                            : 'bg-[#1e293b] border-gray-800 text-gray-300 hover:border-gray-700'
+                        }`}
                       >
-                        Save Remark
-                      </button>
-                    </div>
-                  </>
-                ) : (
-                  <div className="flex items-center justify-center h-full text-gray-500 text-xs">
-                    Select a student submission on the left to inspect their code.
+                        <div className="flex items-center justify-between">
+                          <span className="font-bold text-xs">{sub.studentName}</span>
+                          <span className="text-[10px] font-mono bg-blue-900/60 text-blue-300 px-1.5 py-0.5 rounded">
+                            {sub.score}/100 Pts
+                          </span>
+                        </div>
+                        <div className="text-[11px] text-gray-400 flex items-center justify-between">
+                          <span>Roll: {sub.rollNo}</span>
+                          <span className="font-mono text-emerald-400 font-bold">{sub.language}</span>
+                        </div>
+                        <div className="text-[10px] text-gray-500 flex items-center justify-between">
+                          <span>⏱ {sub.timeTaken}</span>
+                          <span className={sub.tabSwitchFlags > 3 ? 'text-red-400 font-bold' : sub.tabSwitchFlags > 0 ? 'text-amber-400 font-bold' : 'text-gray-400'}>
+                            {sub.tabSwitchFlags > 3 ? `🚨 ${sub.tabSwitchFlags} Flags (Terminated)` : sub.tabSwitchFlags > 0 ? `⚠️ ${sub.tabSwitchFlags} Tab switches` : '✓ 0 Flags'}
+                          </span>
+                        </div>
+                      </div>
+                    ))}
                   </div>
-                )}
-              </div>
 
+                  {/* Right Column: Monaco Code Viewer (8 cols) */}
+                  <div className="md:col-span-8 flex flex-col bg-[#1e293b] overflow-hidden">
+                    {selectedSubmission ? (
+                      <>
+                        {/* Top Status Bar */}
+                        <div className="p-3 bg-[#0f172a] border-b border-gray-800 flex items-center justify-between text-xs">
+                          <div>
+                            <span className="text-gray-400">Exam Question: </span>
+                            <span className="text-white font-bold">{selectedSubmission.problemTitle}</span>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            {selectedSubmission.tabSwitchFlags > 3 && (
+                              <span className="bg-red-950 text-red-300 border border-red-700 px-2 py-0.5 rounded font-mono font-bold text-[10px]">
+                                🚨 Auto-Submitted (&gt;3 Flags)
+                              </span>
+                            )}
+                            <button
+                              onClick={() => handleAllowReassessment(selectedSubmission)}
+                              className="bg-amber-600 hover:bg-amber-500 text-white font-bold px-2.5 py-1 rounded-lg text-xs transition flex items-center gap-1 shadow-sm cursor-pointer"
+                              title="Allow this student to retake the assessment"
+                            >
+                              <span>🔄</span>
+                              <span>Allow Reassessment</span>
+                            </button>
+                            <span className="bg-emerald-950 text-emerald-400 border border-emerald-800 px-2 py-0.5 rounded font-mono font-bold text-[10px]">
+                              {selectedSubmission.verdict}
+                            </span>
+                          </div>
+                        </div>
+
+                        {/* Read-Only Monaco Editor */}
+                        <div className="flex-1 min-h-[300px] h-[360px]">
+                          <Editor
+                            height="100%"
+                            theme="vs-dark"
+                            language={
+                              selectedSubmission.language === 'CPP'
+                                ? 'cpp'
+                                : selectedSubmission.language === 'PYTHON'
+                                ? 'python'
+                                : selectedSubmission.language === 'C'
+                                ? 'c'
+                                : 'java'
+                            }
+                            value={selectedSubmission.sourceCode}
+                            options={{
+                              readOnly: true,
+                              fontSize: 13,
+                              minimap: { enabled: false },
+                              lineNumbers: 'on',
+                              scrollBeyondLastLine: false,
+                              automaticLayout: true,
+                            }}
+                          />
+                        </div>
+
+                        {/* Professor Remarks & Grade Bar */}
+                        <div className="p-3 bg-[#0f172a] border-t border-gray-800 flex items-center justify-between gap-3 text-xs">
+                          <div className="flex-1">
+                            <input
+                              type="text"
+                              placeholder="Add professor feedback (e.g. 'Good optimal recursion, clean code')..."
+                              className="w-full bg-[#1e293b] border border-gray-800 rounded-lg px-3 py-1.5 text-xs text-gray-200 focus:outline-none focus:border-blue-500"
+                            />
+                          </div>
+                          <button
+                            onClick={() => alert(`Feedback saved for ${selectedSubmission.studentName}!`)}
+                            className="bg-blue-600 hover:bg-blue-500 text-white font-bold px-4 py-1.5 rounded-lg text-xs transition-colors"
+                          >
+                            Save Remark
+                          </button>
+                        </div>
+                      </>
+                    ) : (
+                      <div className="flex items-center justify-center h-full text-gray-500 text-xs">
+                        Select a student submission on the left to inspect their code.
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
             </div>
 
           </div>
@@ -2272,184 +2351,198 @@ int main() {
 
             {/* Modal Body: Comparison List (Left) + Side-by-Side Monaco Diff (Right) */}
             <div className="flex-1 grid grid-cols-1 lg:grid-cols-12 overflow-hidden">
-              
-              {/* Left Column: Flagged Pair Matches (4 cols) */}
-              <div className="lg:col-span-4 border-r border-gray-800 overflow-y-auto p-4 space-y-2.5 bg-[#0f172a]/70">
-                <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-2 flex items-center justify-between">
-                  <span>Flagged Comparison Pairs:</span>
-                  <span className="font-mono text-gray-500">{plagiarismReport?.matches?.length || 0} Total</span>
-                </p>
-
-                {plagiarismReport?.matches?.map((pair, idx) => (
-                  <div
-                    key={`pair-${idx}`}
-                    onClick={() => setSelectedMatchPair(pair)}
-                    className={`p-3.5 rounded-2xl border transition-all cursor-pointer text-left space-y-2 ${
-                      selectedMatchPair === pair
-                        ? 'bg-red-950/50 border-red-500 text-white shadow-md'
-                        : 'bg-[#1e293b] border-gray-800 text-gray-300 hover:border-gray-700'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between">
-                      <span className="font-bold text-xs text-white">
-                        {pair.studentNameA} <span className="text-gray-500">↔</span> {pair.studentNameB}
-                      </span>
-                      <span
-                        className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded-full ${
-                          pair.riskLevel === 'HIGH'
-                            ? 'bg-red-500/20 text-red-400 border border-red-500/40'
-                            : pair.riskLevel === 'MEDIUM'
-                            ? 'bg-amber-500/20 text-amber-400 border border-amber-500/40'
-                            : 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/40'
-                        }`}
-                      >
-                        {pair.similarityPercentage}% Match
-                      </span>
-                    </div>
-
-                    {/* Similarity Progress Bar */}
-                    <div className="w-full bg-gray-800 rounded-full h-1.5 overflow-hidden">
-                      <div
-                        className={`h-full rounded-full transition-all ${
-                          pair.riskLevel === 'HIGH'
-                            ? 'bg-red-500'
-                            : pair.riskLevel === 'MEDIUM'
-                            ? 'bg-amber-500'
-                            : 'bg-emerald-500'
-                        }`}
-                        style={{ width: `${pair.similarityPercentage}%` }}
-                      />
-                    </div>
-
-                    <p className="text-[11px] text-gray-400 line-clamp-2">
-                      {pair.matchedStructurePattern}
+              {(!plagiarismReport?.matches || plagiarismReport.matches.length === 0) ? (
+                <div className="lg:col-span-12 p-14 text-center space-y-4 flex flex-col items-center justify-center">
+                  <div className="text-5xl">🛡️</div>
+                  <h4 className="text-base font-bold text-white">No Code Plagiarism Detected</h4>
+                  <p className="text-xs text-gray-400 max-w-md mx-auto leading-relaxed">
+                    No structural code similarities flagged for <strong className="text-blue-400">{inspectAssessment.assessmentName}</strong>. Automated MOSS-style tokenization and pairwise AST comparison require at least <strong>2 student submissions</strong> to analyze code similarity.
+                  </p>
+                  <div className="inline-flex items-center gap-2 px-3 py-1 bg-emerald-950/60 text-emerald-400 border border-emerald-800 rounded-full text-xs font-mono">
+                    <span>✓</span>
+                    <span>Submissions Analyzed: {plagiarismReport?.totalSubmissionsAnalyzed || 0}</span>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  {/* Left Column: Flagged Pair Matches (4 cols) */}
+                  <div className="lg:col-span-4 border-r border-gray-800 overflow-y-auto p-4 space-y-2.5 bg-[#0f172a]/70">
+                    <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-2 flex items-center justify-between">
+                      <span>Flagged Comparison Pairs:</span>
+                      <span className="font-mono text-gray-500">{plagiarismReport?.matches?.length || 0} Total</span>
                     </p>
 
-                    <div className="text-[10px] text-gray-500 flex items-center justify-between pt-1 border-t border-gray-800/80">
-                      <span>Rolls: {pair.rollNoA} vs {pair.rollNoB}</span>
-                      <span
-                        className={`font-mono font-bold ${
-                          pair.status === 'PENALIZED'
-                            ? 'text-red-400'
-                            : pair.status === 'DISMISSED'
-                            ? 'text-green-400'
-                            : 'text-amber-400'
+                    {plagiarismReport?.matches?.map((pair, idx) => (
+                      <div
+                        key={`pair-${idx}`}
+                        onClick={() => setSelectedMatchPair(pair)}
+                        className={`p-3.5 rounded-2xl border transition-all cursor-pointer text-left space-y-2 ${
+                          selectedMatchPair === pair
+                            ? 'bg-red-950/50 border-red-500 text-white shadow-md'
+                            : 'bg-[#1e293b] border-gray-800 text-gray-300 hover:border-gray-700'
                         }`}
                       >
-                        {pair.status}
-                      </span>
-                    </div>
-                  </div>
-                ))}
-              </div>
-
-              {/* Right Column: Side-by-Side Dual Monaco Code Inspector (8 cols) */}
-              <div className="lg:col-span-8 flex flex-col bg-[#1e293b] overflow-hidden">
-                {selectedMatchPair ? (
-                  <>
-                    {/* Top Diff Header */}
-                    <div className="p-3 bg-[#0f172a] border-b border-gray-800 flex items-center justify-between text-xs">
-                      <div className="space-y-0.5">
-                        <span className="text-gray-400">Exam Question: </span>
-                        <strong className="text-white">{selectedMatchPair.problemTitle}</strong>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <span className="bg-red-950 text-red-400 border border-red-800 px-2 py-0.5 rounded font-mono font-bold text-[10px]">
-                          {selectedMatchPair.similarityPercentage}% Structural Match
-                        </span>
-                      </div>
-                    </div>
-
-                    {/* Dual Monaco Split-Pane: Student A on Left, Student B on Right */}
-                    <div className="flex-1 grid grid-cols-1 md:grid-cols-2 gap-0 overflow-hidden min-h-[300px] h-[360px]">
-                      
-                      {/* Left: Student A */}
-                      <div className="border-r border-gray-800 flex flex-col h-full overflow-hidden">
-                        <div className="p-2 bg-[#112446] border-b border-gray-800 flex items-center justify-between text-xs">
-                          <span className="font-bold text-blue-300">
-                            👤 {selectedMatchPair.studentNameA} ({selectedMatchPair.rollNoA})
+                        <div className="flex items-center justify-between">
+                          <span className="font-bold text-xs text-white">
+                            {pair.studentNameA} <span className="text-gray-500">↔</span> {pair.studentNameB}
                           </span>
-                          <span className="text-[10px] font-mono text-gray-400 font-bold">
-                            {selectedMatchPair.language}
+                          <span
+                            className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded-full ${
+                              pair.riskLevel === 'HIGH'
+                                ? 'bg-red-500/20 text-red-400 border border-red-500/40'
+                                : pair.riskLevel === 'MEDIUM'
+                                ? 'bg-amber-500/20 text-amber-400 border border-amber-500/40'
+                                : 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/40'
+                            }`}
+                          >
+                            {pair.similarityPercentage}% Match
                           </span>
                         </div>
-                        <div className="flex-1 h-full">
-                          <Editor
-                            height="100%"
-                            theme="vs-dark"
-                            language={selectedMatchPair.language === 'CPP' ? 'cpp' : 'java'}
-                            value={selectedMatchPair.sourceCodeA}
-                            options={{
-                              readOnly: true,
-                              fontSize: 12,
-                              minimap: { enabled: false },
-                              lineNumbers: 'on',
-                              scrollBeyondLastLine: false,
-                              automaticLayout: true,
-                            }}
+
+                        {/* Similarity Progress Bar */}
+                        <div className="w-full bg-gray-800 rounded-full h-1.5 overflow-hidden">
+                          <div
+                            className={`h-full rounded-full transition-all ${
+                              pair.riskLevel === 'HIGH'
+                                ? 'bg-red-500'
+                                : pair.riskLevel === 'MEDIUM'
+                                ? 'bg-amber-500'
+                                : 'bg-emerald-500'
+                            }`}
+                            style={{ width: `${pair.similarityPercentage}%` }}
                           />
                         </div>
-                      </div>
 
-                      {/* Right: Student B */}
-                      <div className="flex flex-col h-full overflow-hidden">
-                        <div className="p-2 bg-[#112446] border-b border-gray-800 flex items-center justify-between text-xs">
-                          <span className="font-bold text-red-300">
-                            👤 {selectedMatchPair.studentNameB} ({selectedMatchPair.rollNoB})
-                          </span>
-                          <span className="text-[10px] font-mono text-gray-400 font-bold">
-                            {selectedMatchPair.language}
+                        <p className="text-[11px] text-gray-400 line-clamp-2">
+                          {pair.matchedStructurePattern}
+                        </p>
+
+                        <div className="text-[10px] text-gray-500 flex items-center justify-between pt-1 border-t border-gray-800/80">
+                          <span>Rolls: {pair.rollNoA} vs {pair.rollNoB}</span>
+                          <span
+                            className={`font-mono font-bold ${
+                              pair.status === 'PENALIZED'
+                                ? 'text-red-400'
+                                : pair.status === 'DISMISSED'
+                                ? 'text-green-400'
+                                : 'text-amber-400'
+                            }`}
+                          >
+                            {pair.status}
                           </span>
                         </div>
-                        <div className="flex-1 h-full">
-                          <Editor
-                            height="100%"
-                            theme="vs-dark"
-                            language={selectedMatchPair.language === 'CPP' ? 'cpp' : 'java'}
-                            value={selectedMatchPair.sourceCodeB}
-                            options={{
-                              readOnly: true,
-                              fontSize: 12,
-                              minimap: { enabled: false },
-                              lineNumbers: 'on',
-                              scrollBeyondLastLine: false,
-                              automaticLayout: true,
-                            }}
-                          />
-                        </div>
                       </div>
-
-                    </div>
-
-                    {/* Bottom Action Footer for Faculty Decision */}
-                    <div className="p-3 bg-[#0f172a] border-t border-gray-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
-                      <p className="text-[11px] text-gray-400">
-                        {selectedMatchPair.matchedStructurePattern}
-                      </p>
-
-                      <div className="flex items-center gap-2 flex-shrink-0">
-                        <button
-                          onClick={() => handleDismissPair(selectedMatchPair)}
-                          className="bg-gray-800 hover:bg-gray-700 text-gray-200 font-bold px-3 py-1.5 rounded-lg transition-colors border border-gray-700"
-                        >
-                          ✅ Dismiss False Positive
-                        </button>
-                        <button
-                          onClick={() => handlePenalizePair(selectedMatchPair)}
-                          className="bg-red-600 hover:bg-red-500 text-white font-bold px-4 py-1.5 rounded-lg transition-colors shadow-sm"
-                        >
-                          🚩 Apply Plagiarism Penalty (-50%)
-                        </button>
-                      </div>
-                    </div>
-                  </>
-                ) : (
-                  <div className="flex items-center justify-center h-full text-gray-500 text-xs">
-                    Select a flagged comparison pair on the left to inspect side-by-side code diff.
+                    ))}
                   </div>
-                )}
-              </div>
 
+                  {/* Right Column: Side-by-Side Dual Monaco Code Inspector (8 cols) */}
+                  <div className="lg:col-span-8 flex flex-col bg-[#1e293b] overflow-hidden">
+                    {selectedMatchPair ? (
+                      <>
+                        {/* Top Diff Header */}
+                        <div className="p-3 bg-[#0f172a] border-b border-gray-800 flex items-center justify-between text-xs">
+                          <div className="space-y-0.5">
+                            <span className="text-gray-400">Exam Question: </span>
+                            <strong className="text-white">{selectedMatchPair.problemTitle}</strong>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <span className="bg-red-950 text-red-400 border border-red-800 px-2 py-0.5 rounded font-mono font-bold text-[10px]">
+                              {selectedMatchPair.similarityPercentage}% Structural Match
+                            </span>
+                          </div>
+                        </div>
+
+                        {/* Dual Monaco Split-Pane: Student A on Left, Student B on Right */}
+                        <div className="flex-1 grid grid-cols-1 md:grid-cols-2 gap-0 overflow-hidden min-h-[300px] h-[360px]">
+                          
+                          {/* Left: Student A */}
+                          <div className="border-r border-gray-800 flex flex-col h-full overflow-hidden">
+                            <div className="p-2 bg-[#112446] border-b border-gray-800 flex items-center justify-between text-xs">
+                              <span className="font-bold text-blue-300">
+                                👤 {selectedMatchPair.studentNameA} ({selectedMatchPair.rollNoA})
+                              </span>
+                              <span className="text-[10px] font-mono text-gray-400 font-bold">
+                                {selectedMatchPair.language}
+                              </span>
+                            </div>
+                            <div className="flex-1 h-full">
+                              <Editor
+                                height="100%"
+                                theme="vs-dark"
+                                language={selectedMatchPair.language === 'CPP' ? 'cpp' : 'java'}
+                                value={selectedMatchPair.sourceCodeA}
+                                options={{
+                                  readOnly: true,
+                                  fontSize: 12,
+                                  minimap: { enabled: false },
+                                  lineNumbers: 'on',
+                                  scrollBeyondLastLine: false,
+                                  automaticLayout: true,
+                                }}
+                              />
+                            </div>
+                          </div>
+
+                          {/* Right: Student B */}
+                          <div className="flex flex-col h-full overflow-hidden">
+                            <div className="p-2 bg-[#112446] border-b border-gray-800 flex items-center justify-between text-xs">
+                              <span className="font-bold text-red-300">
+                                👤 {selectedMatchPair.studentNameB} ({selectedMatchPair.rollNoB})
+                              </span>
+                              <span className="text-[10px] font-mono text-gray-400 font-bold">
+                                {selectedMatchPair.language}
+                              </span>
+                            </div>
+                            <div className="flex-1 h-full">
+                              <Editor
+                                height="100%"
+                                theme="vs-dark"
+                                language={selectedMatchPair.language === 'CPP' ? 'cpp' : 'java'}
+                                value={selectedMatchPair.sourceCodeB}
+                                options={{
+                                  readOnly: true,
+                                  fontSize: 12,
+                                  minimap: { enabled: false },
+                                  lineNumbers: 'on',
+                                  scrollBeyondLastLine: false,
+                                  automaticLayout: true,
+                                }}
+                              />
+                            </div>
+                          </div>
+
+                        </div>
+
+                        {/* Bottom Action Footer for Faculty Decision */}
+                        <div className="p-3 bg-[#0f172a] border-t border-gray-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+                          <p className="text-[11px] text-gray-400">
+                            {selectedMatchPair.matchedStructurePattern}
+                          </p>
+
+                          <div className="flex items-center gap-2 flex-shrink-0">
+                            <button
+                              onClick={() => handleDismissPair(selectedMatchPair)}
+                              className="bg-gray-800 hover:bg-gray-700 text-gray-200 font-bold px-3 py-1.5 rounded-lg transition-colors border border-gray-700"
+                            >
+                              ✅ Dismiss False Positive
+                            </button>
+                            <button
+                              onClick={() => handlePenalizePair(selectedMatchPair)}
+                              className="bg-red-600 hover:bg-red-500 text-white font-bold px-4 py-1.5 rounded-lg transition-colors shadow-sm"
+                            >
+                              🚩 Apply Plagiarism Penalty (-50%)
+                            </button>
+                          </div>
+                        </div>
+                      </>
+                    ) : (
+                      <div className="flex items-center justify-center h-full text-gray-500 text-xs">
+                        Select a flagged comparison pair on the left to inspect side-by-side code diff.
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
             </div>
 
           </div>

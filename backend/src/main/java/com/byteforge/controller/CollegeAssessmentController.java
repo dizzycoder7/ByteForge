@@ -128,6 +128,7 @@ public class CollegeAssessmentController {
                 .browserRestrictions(request.browserRestrictions())
                 .enableReview(request.enableReview())
                 .hideStudentReport(request.hideStudentReport())
+                .maxFlags(request.maxFlags() != null && request.maxFlags() > 0 ? request.maxFlags() : 3)
                 .allowedLanguages(request.allowedLanguages() != null ? request.allowedLanguages() : "C,C++,Java,Pyth 3")
                 .collegeName(request.collegeName() != null ? request.collegeName() : "Delhi Technological University")
                 .status("SCHEDULED")
@@ -241,7 +242,11 @@ public class CollegeAssessmentController {
                 .tabSwitchFlags(request.tabSwitchFlags())
                 .timeTaken(
                         request.timeTaken() != null ? request.timeTaken() : (evaluation.maxExecutionTimeMs() + " ms"))
-                .facultyFeedback(evaluation.errorMessage())
+                .facultyFeedback(request.tabSwitchFlags() > 3
+                        ? ((evaluation.errorMessage() != null && !evaluation.errorMessage().isBlank()
+                                ? evaluation.errorMessage() + " | " : "") +
+                           "AUTO-TERMINATED: Exceeded maximum proctoring limit (" + request.tabSwitchFlags() + " tab switch violations).")
+                        : evaluation.errorMessage())
                 .build();
 
         com.byteforge.entity.AssessmentSubmission saved = submissionRepository.save(sub);
@@ -336,6 +341,50 @@ public class CollegeAssessmentController {
         return ResponseEntity.ok(mapToSubmissionResponse(updated));
     }
 
+    /**
+     * Faculty/Admin action: Allows a student to take a reassessment by clearing
+     * their previous submission records and resetting their attempt.
+     */
+    @DeleteMapping("/{id}/submissions/reset")
+    @org.springframework.transaction.annotation.Transactional
+    public ResponseEntity<java.util.Map<String, Object>> resetStudentSubmissions(
+            @PathVariable Long id,
+            @RequestParam String studentHandle,
+            Authentication authentication) {
+
+        boolean isFacultyOrAdmin = authentication != null && authentication.getAuthorities().stream()
+                .anyMatch(a -> a.getAuthority().equals("ROLE_ADMIN") || a.getAuthority().equals("ROLE_FACULTY_ADMIN"));
+
+        if (!isFacultyOrAdmin) {
+            throw new org.springframework.web.server.ResponseStatusException(
+                    HttpStatus.FORBIDDEN, "Only faculty mentors or administrators can grant reassessments.");
+        }
+
+        CollegeAssessment assessment = assessmentRepository.findById(id)
+                .orElseThrow(() -> new org.springframework.web.server.ResponseStatusException(
+                        HttpStatus.NOT_FOUND, "Assessment not found with id: " + id));
+
+        int cleared = submissionRepository.findByAssessmentIdAndStudentHandleOrderBySubmittedAtDesc(id, studentHandle).size();
+        submissionRepository.deleteByAssessmentIdAndStudentHandle(id, studentHandle);
+
+        return ResponseEntity.ok(java.util.Map.of(
+                "success", true,
+                "message", "Reassessment granted for @" + studentHandle + ". Cleared " + cleared + " previous submission(s).",
+                "clearedCount", cleared,
+                "studentHandle", studentHandle,
+                "assessmentId", id
+        ));
+    }
+
+    @PostMapping("/{id}/reassessment/allow")
+    @org.springframework.transaction.annotation.Transactional
+    public ResponseEntity<java.util.Map<String, Object>> allowReassessment(
+            @PathVariable Long id,
+            @RequestParam String studentHandle,
+            Authentication authentication) {
+        return resetStudentSubmissions(id, studentHandle, authentication);
+    }
+
     @GetMapping("/{id}/plagiarism")
     public ResponseEntity<com.byteforge.dto.PlagiarismReportDto> getPlagiarismReport(
             @PathVariable Long id) {
@@ -376,6 +425,7 @@ public class CollegeAssessmentController {
                 a.isBrowserRestrictions(),
                 a.isEnableReview(),
                 a.isHideStudentReport(),
+                a.getMaxFlags() > 0 ? a.getMaxFlags() : 3,
                 a.getAllowedLanguages(),
                 a.getCollegeName(),
                 a.getStatus(),

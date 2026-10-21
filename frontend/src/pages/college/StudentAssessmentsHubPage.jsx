@@ -516,7 +516,7 @@ export default function StudentAssessmentsHubPage() {
                       <div className="flex items-center gap-2 bg-gray-50 p-2 rounded-xl border border-gray-100">
                         <span>🛡️</span>
                         <span>
-                          Anti-Cheat: <strong className="text-gray-900">{a.browserRestrictions ? 'Strict Lock' : 'Standard'}</strong>
+                          Anti-Cheat: <strong className="text-gray-900">{a.browserRestrictions ? `Strict (${a.maxFlags || 3} Flags)` : 'Standard'}</strong>
                         </span>
                       </div>
                     </div>

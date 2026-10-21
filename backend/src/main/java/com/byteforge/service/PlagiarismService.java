@@ -32,47 +32,54 @@ public class PlagiarismService {
 
         List<PlagiarismReportDto.PlagiarismMatchPairDto> matches = new ArrayList<>();
 
-        if (subs.size() >= 2) {
-            // Pairwise comparison
-            for (int i = 0; i < subs.size(); i++) {
-                for (int j = i + 1; j < subs.size(); j++) {
-                    AssessmentSubmission s1 = subs.get(i);
-                    AssessmentSubmission s2 = subs.get(j);
-
-                    int sim = computeCodeSimilarity(s1.getSourceCode(), s2.getSourceCode());
-                    String risk = sim >= 75 ? "HIGH" : sim >= 50 ? "MEDIUM" : "LOW";
-                    String pattern = sim >= 75
-                            ? "Identical AST logic & recursion subtree with renamed identifiers"
-                            : sim >= 50
-                            ? "Moderate token overlap in core iterative block"
-                            : "Standard boilerplate structural similarity";
-
-                    matches.add(new PlagiarismReportDto.PlagiarismMatchPairDto(
-                            s1.getId(),
-                            s1.getStudentName(),
-                            s1.getStudentHandle(),
-                            s1.getRollNo(),
-                            s1.getSourceCode(),
-                            s2.getId(),
-                            s2.getStudentName(),
-                            s2.getStudentHandle(),
-                            s2.getRollNo(),
-                            s2.getSourceCode(),
-                            s1.getProblemTitle(),
-                            s1.getLanguage(),
-                            sim,
-                            Math.max(4, sim / 5),
-                            pattern,
-                            risk,
-                            sim >= 75 ? "FLAGGED" : "PENDING_REVIEW"
-                    ));
-                }
-            }
+        if (subs.size() < 2) {
+            log.info("[Plagiarism] Assessment id={} has {} submissions; at least 2 submissions required for similarity analysis", assessmentId, subs.size());
+            return new PlagiarismReportDto(
+                    assessmentId,
+                    assessmentName,
+                    subs.size(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    List.of()
+            );
         }
 
-        // If no real pair matches exist yet, populate benchmark demonstration pairs
-        if (matches.isEmpty()) {
-            matches.addAll(generateBenchmarkDemoMatches(assessmentId));
+        // Pairwise comparison across real student submissions
+        for (int i = 0; i < subs.size(); i++) {
+            for (int j = i + 1; j < subs.size(); j++) {
+                AssessmentSubmission s1 = subs.get(i);
+                AssessmentSubmission s2 = subs.get(j);
+
+                int sim = computeCodeSimilarity(s1.getSourceCode(), s2.getSourceCode());
+                String risk = sim >= 75 ? "HIGH" : sim >= 50 ? "MEDIUM" : "LOW";
+                String pattern = sim >= 75
+                        ? "Identical AST logic & recursion subtree with renamed identifiers"
+                        : sim >= 50
+                        ? "Moderate token overlap in core iterative block"
+                        : "Standard boilerplate structural similarity";
+
+                matches.add(new PlagiarismReportDto.PlagiarismMatchPairDto(
+                        s1.getId(),
+                        s1.getStudentName(),
+                        s1.getStudentHandle(),
+                        s1.getRollNo(),
+                        s1.getSourceCode(),
+                        s2.getId(),
+                        s2.getStudentName(),
+                        s2.getStudentHandle(),
+                        s2.getRollNo(),
+                        s2.getSourceCode(),
+                        s1.getProblemTitle(),
+                        s1.getLanguage(),
+                        sim,
+                        Math.max(4, sim / 5),
+                        pattern,
+                        risk,
+                        sim >= 75 ? "FLAGGED" : "PENDING_REVIEW"
+                ));
+            }
         }
 
         // Sort highest similarity first
@@ -85,7 +92,7 @@ public class PlagiarismService {
         return new PlagiarismReportDto(
                 assessmentId,
                 assessmentName,
-                Math.max(subs.size(), 4),
+                subs.size(),
                 matches.size(),
                 high,
                 med,
@@ -137,133 +144,5 @@ public class PlagiarismService {
             ngrams.add(sb.toString().trim());
         }
         return ngrams;
-    }
-
-    private List<PlagiarismReportDto.PlagiarismMatchPairDto> generateBenchmarkDemoMatches(Long assessmentId) {
-        String studentACode = """
-import java.util.*;
-
-public class Solution {
-    public TreeNode invertTree(TreeNode root) {
-        if (root == null) return null;
-        // Invert subtrees recursively
-        TreeNode tempLeft = invertTree(root.left);
-        TreeNode tempRight = invertTree(root.right);
-        root.left = tempRight;
-        root.right = tempLeft;
-        return root;
-    }
-}
-""";
-
-        String studentBCode = """
-import java.util.*;
-
-public class Solution {
-    public TreeNode invertTree(TreeNode r) {
-        if (r == null) return null;
-        // Swap left and right child nodes
-        TreeNode l = invertTree(r.left);
-        TreeNode rt = invertTree(r.right);
-        r.left = rt;
-        r.right = l;
-        return r;
-    }
-}
-""";
-
-        String studentCCode = """
-#include <iostream>
-#include <vector>
-using namespace std;
-
-int maxSubArray(vector<int>& nums) {
-    int maxAns = nums[0];
-    int sum = 0;
-    for (int x : nums) {
-        sum += x;
-        if (sum > maxAns) maxAns = sum;
-        if (sum < 0) sum = 0;
-    }
-    return maxAns;
-}
-""";
-
-        String studentDCode = """
-#include <iostream>
-#include <vector>
-using namespace std;
-
-int maxSubArray(vector<int>& arr) {
-    int totalMax = arr[0];
-    int currentRunning = 0;
-    for (int val : arr) {
-        currentRunning += val;
-        if (currentRunning > totalMax) totalMax = currentRunning;
-        if (currentRunning < 0) currentRunning = 0;
-    }
-    return totalMax;
-}
-""";
-
-        return List.of(
-                new PlagiarismReportDto.PlagiarismMatchPairDto(
-                        101L,
-                        "Aryan Gupta",
-                        "aryan_g",
-                        "2023CSB1055",
-                        studentACode,
-                        102L,
-                        "Vikram Malhotra",
-                        "vikram_m",
-                        "2023CSB1062",
-                        studentBCode,
-                        "Problem 1: Invert a Binary Tree",
-                        "JAVA",
-                        94,
-                        12,
-                        "Identical recursive AST inversion logic with only parameter renaming (r vs root)",
-                        "HIGH",
-                        "FLAGGED"
-                ),
-                new PlagiarismReportDto.PlagiarismMatchPairDto(
-                        103L,
-                        "Rohan Sethi",
-                        "rohan_s",
-                        "2023CSB1074",
-                        studentCCode,
-                        104L,
-                        "Kunal Varma",
-                        "kunal_v",
-                        "2023CSB1089",
-                        studentDCode,
-                        "Problem 2: Maximum Subarray Sum (Kadane)",
-                        "CPP",
-                        88,
-                        10,
-                        "Identical Kadane reset conditions & loop accumulator with variable substitution",
-                        "HIGH",
-                        "FLAGGED"
-                ),
-                new PlagiarismReportDto.PlagiarismMatchPairDto(
-                        105L,
-                        "Priya Sharma",
-                        "priya_sharma",
-                        "2023CSB1042",
-                        studentACode,
-                        106L,
-                        "Rohit Coder",
-                        "rohit_coder",
-                        "2023CSB1018",
-                        studentCCode,
-                        "Problem 1 vs Problem 2",
-                        "JAVA / CPP",
-                        22,
-                        2,
-                        "Standard import boilerplate and main wrapper syntax",
-                        "LOW",
-                        "CLEAN"
-                )
-        );
     }
 }

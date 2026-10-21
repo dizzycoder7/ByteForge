@@ -15,6 +15,7 @@ public record AssessmentResponse(
     boolean browserRestrictions,
     boolean enableReview,
     boolean hideStudentReport,
+    int maxFlags,
     String allowedLanguages,
     String collegeName,
     String status,
